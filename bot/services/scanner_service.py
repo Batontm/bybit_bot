@@ -4,7 +4,7 @@
 from typing import List, Optional
 from pybit.unified_trading import HTTP
 from config.settings import logger
-from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET
+from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, get_pybit_kwargs
 
 
 class MarketScanner:
@@ -35,7 +35,7 @@ class MarketScanner:
         5. EXISTS in current environment (optional verification)
         """
         try:
-            from config.api_config import BYBIT_TESTNET
+            from config.api_config import BYBIT_TESTNET, BYBIT_DEMO
             
             # Получаем все тикеры (с Mainnet для поиска хайповых монет)
             response = self.client.get_tickers(category="spot")
@@ -44,13 +44,12 @@ class MarketScanner:
                 logger.error(f"❌ Ошибка получения тикеров: {response['retMsg']}")
                 return []
             
-            # Если мы на тестнете, нам нужно знать, какие монеты там вообще есть
+            # Если мы на тестнете/демо, нам нужно знать, какие монеты там вообще есть
             supported_symbols = set()
-            if BYBIT_TESTNET:
+            if BYBIT_TESTNET or BYBIT_DEMO:
                 try:
-                    # Создаем временный клиент для тестнета
-                    testnet_client = HTTP(testnet=True)
-                    instr_resp = testnet_client.get_instruments_info(category="spot")
+                    env_client = HTTP(**get_pybit_kwargs())
+                    instr_resp = env_client.get_instruments_info(category="spot")
                     if instr_resp['retCode'] == 0:
                         supported_symbols = {item['symbol'] for item in instr_resp['result']['list']}
                         logger.debug(f"🔍 Тестнет поддерживает {len(supported_symbols)} монет")
@@ -77,7 +76,7 @@ class MarketScanner:
                     continue
                 
                 # 2.1 Фильтр по доступности на Тестнете (если применимо)
-                if BYBIT_TESTNET and supported_symbols and symbol not in supported_symbols:
+                if (BYBIT_TESTNET or BYBIT_DEMO) and supported_symbols and symbol not in supported_symbols:
                     continue
                     
                 # 3. Фильтр токенов с плечом (суффиксы)

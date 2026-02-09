@@ -10,10 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config.settings import logger, TIMEZONE, setup_logger
-from config.api_config import validate_config
+from config.api_config import validate_config, get_pybit_kwargs
 from config.trading_config import DEFAULT_TRADING_PAIRS
 from bot.controller import controller
-from bot.telegram_client.bot import create_telegram_bot
+from bot.telegram_aiogram.bot import create_telegram_bot
 from bot.perplexity_client import perplexity_client
 from bot.services.balance_service import balance_service
 from bot.error_tracker import error_tracker
@@ -54,7 +54,7 @@ class TradingBot:
             from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET
             
             client = HTTP(
-                testnet=True,
+                **get_pybit_kwargs(),
                 api_key=BYBIT_API_KEY,
                 api_secret=BYBIT_API_SECRET,
                 recv_window=60000

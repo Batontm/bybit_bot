@@ -5,7 +5,7 @@ from typing import Dict, Optional, List
 from datetime import datetime, timedelta
 from pybit.unified_trading import HTTP
 from config.settings import logger, TIMEZONE
-from config.api_config import BYBIT_TESTNET
+from config.api_config import BYBIT_TESTNET, get_pybit_kwargs
 from config.trading_config import (
     MIN_ANALYSIS_INTERVAL_PER_PAIR,
     THRESHOLD_AUTO_TRADE,
@@ -24,7 +24,7 @@ class AnalysisService:
     
     def __init__(self):
         self.llm_repo = LLMRequestsRepository()
-        self.bybit_client = HTTP(testnet=BYBIT_TESTNET)
+        self.bybit_client = HTTP(**get_pybit_kwargs())
     
     async def analyze_pair(self, pair: str, timeframe: str = "1h", 
                           use_cache: bool = True) -> Optional[Dict]:

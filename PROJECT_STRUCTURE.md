@@ -1,31 +1,42 @@
 # Bybit Trading Bot — Полная документация проекта
 
-> **Последнее обновление:** 2026-01-06 v1.9.0
-
+> **Последнее обновление:** 2026-02-09 v2.1.0
 
 ## 📋 Обзор
 
-Автоматизированный торговый бот для **спотовой торговли на Bybit** с AI-анализом через Perplexity.
+Автоматизированный торговый бот для **спотовой торговли на Bybit** с AI-анализом через Perplexity, управлением через Telegram (aiogram) и спот-фьючерсным арбитражем.
 
 | Параметр | Значение |
 |----------|----------|
 | **Язык** | Python 3.12+ |
-| **Биржа** | Bybit Testnet (спот) |
-| **AI** | Perplexity API (модель Sonar) |
-| **Интерфейс** | Telegram Bot |
-| **БД** | SQLite (`data/bot.db`) |
-| **Сервер** | 217.12.37.42:58291 (root) |
+| **Биржа** | Bybit Demo Trading (спот + фьючерсы) |
+| **API URL** | `https://api-demo.bybit.com` |
+| **AI** | Perplexity API (модель Sonar) + Ollama (qwen2.5:1.5b) |
+| **Telegram** | aiogram 3.x (inline-кнопки, callback) |
+| **БД** | SQLite (`data/bot.db`) — WAL mode, thread-safe |
+| **Сервер** | 217.12.37.42:58291 (root, SSH alias: `bybit-bot`) |
+| **Таймзона** | Europe/Kaliningrad (UTC+2) |
 
-### Что делает бот:
-1. **Мониторит** фиксированные пары (BTC, ETH, SOL) + динамические (Top Gainers)
-2. **Pre-filter**: Python анализ (RSI, Volume) — бесплатно
-3. **AI анализ**: Perplexity API для топ-2 кандидатов — платно
-4. **Авто-вход**: если score ≥ 80 и все риск-лимиты в норме
-5. **Защита позиций**: TP/SL ордера, Trailing Stop, Breakeven, Time Exit
-6. **Пирамидинг**: первоначальный вход 65%, докупка при -0.5%
-7. **Smart DCA**: докупка при просадке -1.5% с учётом AI-анализа
-8. **Auto-SL**: автоматическое создание SL для незащищённых позиций
-9. **Спот-Фьючерс Арбитраж**: авто-funding через SHORT фьючерсов
+### Что делает бот
+
+1. **Светофор (Market Regime)** — BTC 4H: если close > EMA200, RSI14 >= 50 и ATR не в панике (< 2x avg) → ЗЕЛЕНЫЙ, иначе КРАСНЫЙ
+2. **Мониторинг пар** — фиксированные (BTC, ETH, SOL) + динамические Top Gainers (сканер каждый час)
+3. **Pre-filter** — Python-анализ (RSI, EMA, MACD, Volume) — бесплатно, отсеивает слабых кандидатов
+4. **AI-анализ** — Perplexity API для топ-2 кандидатов — платно ($0.02/запрос)
+5. **Авто-вход** — если AI score >= 80 и все риск-лимиты в норме
+6. **Защита позиций** — TP/SL ордера (ATR-based), Trailing Stop, Breakeven, Time Exit
+7. **Пирамидинг** — первоначальный вход 65%, докупка 35% при просадке -0.5%
+8. **Smart DCA** — докупка при просадке -1.5% с учётом AI-анализа (макс. 2 докупки)
+9. **Auto-SL** — автоматическое создание SL для незащищённых позиций
+10. **Спот-Фьючерс Арбитраж** — авто-funding через SHORT фьючерсов (только BTC/ETH — collateral whitelist)
+11. **Slippage Protection** — бан пары на 24ч при 3+ превышениях проскальзывания
+12. **Telegram UI** — полное управление ботом через inline-кнопки (aiogram 3.x)
+13. **Уведомления и Алерты** — раздельное управление (ON/OFF) через Telegram
+14. **Panic Sell** — экстренная кнопка в Telegram: отмена всех ордеров, закрытие позиций, пауза бота
+15. **Reconcile Orphan Orders** — сверка ордеров биржи и БД, отмена зомби-ордеров
+16. **Dust Balance Handling** — автоматическое закрытие позиций с пылевым остатком в БД
+17. **Telegram Rate Limiter** — ограничение 20 msg/min для защиты от бана
+18. **Systemd Service** — автоперезапуск бота при падении (`bybit-bot.service`)
 
 ---
 
@@ -33,149 +44,311 @@
 
 ```
 bybit_bot/
-├── bot/                          # Основная логика бота
-│   ├── main.py                   # Точка входа, стартовые проверки
-│   ├── controller.py             # Планировщик задач (APScheduler)
-│   ├── perplexity_client.py      # AI-анализ через Perplexity
-│   ├── ollama_client.py          # AI-анализ через Ollama (локально) **NEW**
-│   ├── llm_router.py             # Маршрутизатор LLM провайдеров **NEW**
-│   ├── error_tracker.py          # Трекинг ошибок (в памяти)
+├── bot/                              # Основная логика бота
+│   ├── main.py                       # Точка входа, стартовые проверки
+│   ├── controller.py                 # Планировщик задач (APScheduler), главный цикл
+│   ├── perplexity_client.py          # AI-анализ через Perplexity (sonar)
+│   ├── ollama_client.py              # AI-анализ через Ollama (qwen2.5:1.5b, локально)
+│   ├── llm_router.py                 # Маршрутизатор LLM провайдеров
+│   ├── error_tracker.py              # Кольцевой буфер ошибок (deque, 200 записей)
 │   │
-│   ├── services/                 # Бизнес-логика
-│   │   ├── analysis_service.py   # AI анализ + принятие решений
-│   │   ├── trading_service.py    # Открытие позиций, TP/SL, DCA
-│   │   ├── position_service.py   # Закрытие, Trailing, Breakeven, Auto-SL
-│   │   ├── balance_service.py    # Балансы USDT и монет
-│   │   ├── prefilter_service.py  # Технический pre-filter (RSI, Volume)
-│   │   ├── indicators_service.py # Индикаторы (RSI, Volume, ATR)
-│   │   ├── scanner_service.py    # Сканер Top Gainers (динамические пары)
-│   │   ├── arbitrage_service.py  # Спот-Фьючерс арбитраж (**NEW**)
-│   │   ├── stats_service.py      # Статистика PnL
-│   │   ├── chart_service.py      # Генерация графиков
-│   │   └── websocket_service.py  # Цены в реальном времени (WS)
+│   ├── services/                     # Бизнес-логика (singleton через глобальные экземпляры)
+│   │   ├── market_regime_service.py  # "Светофор" — BTC 4H: EMA200 + RSI14 + ATR spike filter
+│   │   ├── analysis_service.py       # AI-анализ пар + кэширование
+│   │   ├── trading_service.py        # Открытие позиций, TP/SL, DCA, пирамидинг
+│   │   ├── position_service.py       # Закрытие, Trailing, Breakeven, Auto-SL, Time Exit, Reconcile, Dust
+│   │   ├── balance_service.py        # Балансы USDT и монет (UNIFIED account)
+│   │   ├── prefilter_service.py      # Технический pre-filter (RSI, EMA, MACD, Volume)
+│   │   ├── indicators_service.py     # Индикаторы: RSI, EMA, MACD, ATR, Bollinger Bands
+│   │   ├── scanner_service.py        # Сканер Top Gainers (mainnet данные)
+│   │   ├── arbitrage_service.py      # Спот-Фьючерс арбитраж (funding rates, collateral whitelist)
+│   │   ├── stats_service.py          # Статистика: PnL по дням/парам, LLM-отчёты
+│   │   ├── chart_service.py          # Генерация PNG-графиков (matplotlib)
+│   │   └── websocket_service.py      # Цены реалтайм (pybit WebSocket + REST fallback)
 │   │
-│   ├── db/                       # Работа с базой данных
-│   │   ├── connection.py         # SQLite подключение (thread-safe)
-│   │   ├── trades_repo.py        # Сделки, ордера, позиции
-│   │   ├── pnl_repo.py           # История PnL
-│   │   └── llm_requests_repo.py  # Логи запросов к Perplexity
+│   ├── db/                           # Работа с базой данных (SQLite, WAL mode)
+│   │   ├── connection.py             # Singleton подключение (thread-safe)
+│   │   ├── trades_repo.py            # CRUD: позиции, ордера, сделки
+│   │   ├── pnl_repo.py              # PnL по дням и парам
+│   │   ├── daily_pnl_repo.py        # Дневной PnL (upsert по date_utc)
+│   │   ├── llm_requests_repo.py     # Логи запросов к Perplexity/Ollama
+│   │   └── arbitrage_repo.py        # Арбитражные позиции
 │   │
-│   └── telegram_client/          # Telegram интерфейс
-│       ├── bot.py                # Инициализация бота
-│       ├── handlers.py           # Обработчики команд и кнопок
-│       ├── keyboards.py          # Клавиатуры (Reply + Inline)
-│       └── formatters.py         # Форматирование сообщений
+│   ├── telegram_aiogram/            # Telegram интерфейс (АКТИВНЫЙ, aiogram 3.x)
+│   │   ├── bot.py                   # AiogramTelegramBot: start/stop/send_message + rate limiter
+│   │   ├── handlers.py              # Все callback-обработчики + Panic Sell (~740 строк)
+│   │   └── __init__.py
+│   │
+│   └── telegram_client/             # Telegram (УСТАРЕВШИЙ, python-telegram-bot)
+│       ├── bot.py, handlers.py, keyboards.py, formatters.py
 │
-├── config/                       # Конфигурация
-│   ├── settings.py               # Основные настройки из .env
-│   ├── api_config.py             # API ключи
-│   └── trading_config.py         # Параметры торговли
+├── config/
+│   ├── settings.py                  # TIMEZONE, TESTNET, LOG_LEVEL, DB_PATH
+│   ├── api_config.py                # API ключи, get_pybit_kwargs(), BYBIT_DEMO
+│   └── trading_config.py            # Все параметры торговли и риск-менеджмента
 │
-├── data/
-│   └── bot.db                    # SQLite база данных
+├── scripts/                         # Утилиты и диагностика
+│   ├── check_balance.py, sell_all.py, fix_balances.py, db_debug.py ...
 │
-├── logs/
-│   └── bot.log                   # Логи бота
-│
-├── .env                          # Переменные окружения (НЕ в git)
-├── run_bot.sh                    # Скрипт запуска
-└── stop_bot.sh                   # Скрипт остановки
+├── data/bot.db                      # SQLite база данных
+├── logs/bot.log, run.log            # Логи
+├── .env                             # Переменные окружения (НЕ в git)
+├── bybit-bot.service                # Systemd unit (автоперезапуск)
+├── run_bot.sh / stop_bot.sh         # Скрипты запуска/остановки (устаревшие, используется systemd)
+└── PROJECT_STRUCTURE.md             # Эта документация
 ```
 
 ---
 
-## � Ключевые сервисы и методы
+## 🔧 Ключевые сервисы — подробная логика
 
-### `controller.py` — Планировщик задач
+### `main.py` — Точка входа
 
-| Задача | Интервал | Метод | Описание |
-|--------|----------|-------|----------|
-| check_signals | 5 мин | `_check_signals()` | Pre-filter → AI анализ → вход |
-| update_balances | 1 мин | `_update_balances()` | Обновление балансов |
-| check_tpsl | 10 сек | `_check_tpsl()` | Проверка TP/SL |
-| update_prices | 30 сек | `_update_positions_prices()` | Обновление цен |
-| trailing_stop | 30 сек | `_update_trailing_stops()` | Подтяжка SL |
-| check_breakeven | 30 сек | `_check_breakeven()` | Breakeven при +1% |
-| check_time_exit | 5 мин | `_check_time_exit()` | Закрытие мёртвых позиций |
-| check_dca | 2 мин | `_check_dca()` | Smart DCA |
-| **auto_sl** | 2 мин | `_auto_create_missing_sl()` | Авто-создание SL |
-| update_pairs | 1 час | `_update_market_pairs()` | Сканер Top Gainers |
-| reset_daily | 00:00 | `_reset_daily_limits()` | Сброс лимитов |
+При запуске выполняет стартовые проверки:
+1. Валидация конфигурации (API ключи, токены)
+2. Проверка Bybit REST API (get_server_time)
+3. Тестовый ордер (Limit Buy BTC → Cancel) — проверка торговых прав
+4. Проверка WebSocket эндпоинтов
+5. Проверка Perplexity API
+6. Проверка БД (количество таблиц)
+7. Получение балансов
+8. Запуск Telegram бота (aiogram)
+9. Запуск контроллера (APScheduler)
+
+### `controller.py` — BotController (планировщик)
+
+**Режимы:** `ACTIVE` | `RISK_ONLY` | `PAUSED`
+
+**Свойства:**
+- `auto_trading_enabled` — разрешение на авто-торговлю
+- `scanner_enabled` — включение сканера Top Gainers
+- `notifications_enabled` / `alerts_enabled` — раздельное управление уведомлениями
+- `fixed_pairs` — [BTCUSDT, ETHUSDT, SOLUSDT]
+- `dynamic_pairs` — от сканера
+- `dynamic_pairs_data` — {symbol: timestamp} для 24ч памяти
+
+**Задачи планировщика:**
+
+| Задача | Интервал | Метод |
+|--------|----------|-------|
+| Проверка сигналов | 10 мин | `_check_signals()` |
+| Обновление балансов | 1 мин | `_update_balances()` |
+| Проверка TP/SL | 10 сек | `_check_tpsl()` |
+| Обновление цен | 30 сек | `_update_positions_prices()` |
+| Sync Orders | 60 сек | `_sync_orders_and_trades()` |
+| Reconcile Orphans | 5 часов | `_reconcile_orphan_orders()` |
+| Trailing Stop | 30 сек | `_update_trailing_stops()` |
+| Breakeven | 30 сек | `_check_breakeven()` |
+| Time Exit | 5 мин | `_check_time_exit()` |
+| Smart DCA | 2 мин | `_check_dca()` |
+| Auto-SL | 2 мин | `_auto_create_missing_sl()` |
+| Emergency SL | 15 сек | `_emergency_sl_watchdog()` |
+| Сканер пар | 1 час | `_update_market_pairs()` |
+| Сброс лимитов | 00:00 | `_reset_daily_limits()` |
+| Авто-арбитраж | 1 час | `_auto_arbitrage()` |
+| Funding Update | 0:00, 8:00, 16:00 | `_update_arbitrage_funding()` |
+
+**Логика `_check_signals()`:**
+1. Проверка режима (не PAUSED, auto_trading включён)
+2. **Светофор**: `market_regime_service.is_trading_allowed()` — КРАСНЫЙ → пропуск
+3. Сбор пар (fixed + dynamic), исключение пар с открытыми позициями и забаненных
+4. **Pre-filter**: `prefilter_service.scan_and_filter(pairs, top_n=2)`
+5. AI-анализ каждого кандидата через Perplexity
+6. `should_enter_trade(analysis)` — score >= 80
+7. `check_risk_limits()` — лимиты позиций, дневной лосс
+8. `trading_service.open_position(pair, analysis)` → TP/SL ордера
+9. Проверка slippage → бан пары при 3+ превышениях
+10. Telegram уведомление
+
+**`panic_sell_all()` — Экстренная остановка (v2.1):**
+1. Устанавливает режим `PAUSED`, отключает `auto_trading_enabled`
+2. Отменяет ВСЕ ордера на бирже (spot + linear)
+3. Закрывает ВСЕ открытые спот-позиции по рынку
+4. Закрывает ВСЕ арбитражные позиции
+5. Помечает все DB-ордера как `Cancelled`
+6. Вызывается через Telegram кнопку 🛑 PANIC SELL (двухэтапное подтверждение)
+
+**Логика `_auto_arbitrage()`:**
+- В КРАСНОМ режиме: усиленный арбитраж (до 8 позиций, 30% депозита)
+- Сканирование funding rates → Spot LONG + Futures SHORT
+- Динамический размер: `remaining_allocation / remaining_slots`
+- **Collateral whitelist (v2.1):** только BTC/ETH (collateral ratio >= 0.9)
+
+### `market_regime_service.py` — Светофор
+
+Анализ BTC на 4H (mainnet данные):
+- 250 свечей BTCUSDT 4H → EMA200 + RSI14 + ATR spike
+- **ЗЕЛЕНЫЙ**: `close > EMA200` И `RSI14 >= 50` И `ATR_ratio < 2.0`
+- **КРАСНЫЙ**: любое условие не выполнено
+- **ATR spike filter (v2.1):** если текущий ATR(14) > 2x от ATR предыдущих свечей → блокировка (паника/крэш)
+- Кэш: 5 минут
 
 ### `position_service.py` — Управление позициями
 
 | Метод | Описание |
 |-------|----------|
-| `close_position(id, reason)` | Закрыть позицию (с проверкой баланса) |
-| `update_trailing_stops()` | Подтяжка SL при прибыли > 1% |
-| `check_breakeven()` | Перенос SL на вход при прибыли ≥ 1% |
-| `check_time_exit()` | Закрытие позиций старше N часов |
-| `auto_create_missing_sl()` | **НОВОЕ**: Авто-создание SL для позиций без защиты |
-| `_format_qty(pair, qty)` | Форматирование qty (правильные decimals) |
-| `_get_actual_balance(pair)` | Проверка реального баланса на бирже |
+| `close_position(id, reason)` | Отмена ордеров → проверка баланса → Market Sell → PnL |
+| `update_trailing_stops()` | При прибыли > 3%: SL = цена - 1.5% |
+| `check_breakeven()` | При прибыли >= 1%: SL = entry + 0.1% |
+| `check_time_exit()` | Закрытие позиций старше 8ч с движением < 0.5% |
+| `auto_create_missing_sl()` | SL для незащищённых позиций, синхронизация qty |
+| `emergency_sl_watchdog()` | Аварийный SL |
+| `sync_orders_and_trades()` | Синхронизация статусов ордеров с биржей |
+| `reconcile_orphan_orders()` | **(v2.1)** Сверка ордеров биржи ↔ БД, отмена зомби-ордеров |
+| `_get_actual_balance(pair)` | Реальный баланс монеты на бирже |
+| `_format_qty(pair, qty)` | math.floor, правильные decimals |
+
+**Логика `close_position()`:**
+1. Отмена ордеров в БД и на бирже
+2. Получение текущей цены
+3. Проверка реального баланса — если < qty * 0.99 → продаём остаток
+4. **Dust handling (v2.1):** если продажа остатка → ошибка min order size (170217) → закрываем только в БД
+5. Market Sell → при ошибке 170131 повторная попытка с actual_balance
+6. Расчёт PnL, запись в БД
+
+**Логика `reconcile_orphan_orders()` (v2.1):**
+1. Получает открытые ордера с биржи и из БД
+2. Ордера на бирже, но НЕ в БД → отмена на бирже (зомби-ордера)
+3. Ордера в БД, но НЕ на бирже → проверка истории → обновление статуса в БД
+4. Запускается каждые 5 часов через планировщик
 
 ### `trading_service.py` — Торговля
 
 | Метод | Описание |
 |-------|----------|
-| `open_position(pair, analysis)` | Открыть позицию с TP/SL |
+| `open_position(pair, analysis)` | Возвращает `(position, error_message)` |
 | `add_to_position(id, analysis)` | Smart DCA — докупка |
-| `check_risk_limits()` | Проверка всех риск-лимитов |
-| `_place_tp_sl_orders()` | Размещение TP/SL ордеров |
-| `_get_qty_precision(pair)` | Получить точность qty для пары |
+| `check_risk_limits()` | Макс. позиций, дневной лосс, макс. пар |
+| `should_enter_trade(analysis)` | Score >= 80 + тренд OK |
+| `_calculate_position_size()` | risk% * deposit / SL_distance * (score/80) |
 
-### `prefilter_service.py` — Технический фильтр (бесплатно)
+**Логика `open_position()`:**
+1. Тренд-фильтр (EMA20 > EMA50)
+2. ATR-based TP/SL (или фиксированные fallback)
+3. Position sizing: `MAX_RISK_PER_TRADE * deposit / SL_distance`
+4. Корректировка по AI score: `size * (score / 80)`, 0.5x–1.2x
+5. Пирамидинг: первый вход = 65%
+6. Market Buy → TP/SL ордера → возврат `(position, None)` или `(None, "ошибка")`
 
-| Метод | Описание |
-|-------|----------|
-| `scan_and_filter(pairs, top_n)` | Фильтрация пар по RSI/Volume |
-| `calculate_score(pair)` | Расчёт технического score |
+### `prefilter_service.py` — Технический фильтр
+
+**Стратегия "Воронка":** Python фильтр → Perplexity (только лучшие).
+
+Критерии: RSI 25–70, Volume >= 1.2x среднего.
+
+Scoring (0–100): RSI 30–45: +20 | EMA BULLISH: +15 | MACD BULLISH: +10 | Volume 1.5x: +15
+
+### `indicators_service.py` — Технические индикаторы
+
+| Индикатор | Метод | Описание |
+|-----------|-------|----------|
+| RSI | `calculate_rsi(closes, 14)` | 0–100 |
+| EMA | `calculate_ema(closes, period)` | Exponential Moving Average |
+| MACD | `calculate_macd(closes, 12, 26, 9)` | line, signal, histogram |
+| ATR | `calculate_atr(highs, lows, closes, 14)` | волатильность |
+| Bollinger | `calculate_bollinger_bands(closes, 20, 2.0)` | upper, middle, lower |
+| `analyze()` | Полный анализ | Все индикаторы + overall_score/signal |
 
 ### `scanner_service.py` — Сканер Top Gainers
+
+1. Тикеры с **mainnet** (реальные данные)
+2. Фильтр: USDT пары, без стейблов и leverage-токенов
+3. На demo: проверка доступности пары
+4. Критерии: рост 1.5–100% за 24ч, объём > 1M USDT
+5. 24-часовая память в контроллере
+
+### `arbitrage_service.py` — Спот-Фьючерс арбитраж
+
+**Стратегия:** Spot LONG + Futures SHORT → заработок на funding rate.
+
 | Метод | Описание |
 |-------|----------|
-| `get_top_gainers(limit)` | Найти топ-N монет по росту (1.5-100%) и объему (>1M) |
-| **Logic Memory** | Сохраняет пары в мониторинге на 24 часа (в контроллере) |
+| `scan_funding_rates()` | Сканирование funding для топ-ликвидных пар |
+| `open_arbitrage(pair, size_usd)` | Spot Buy + Futures Short |
+| `close_arbitrage(position_id)` | Spot Sell + Futures Close |
+| `update_funding_for_all()` | Обновление накопленного funding |
+| `get_dashboard()` | Дашборд: позиции, PnL, статистика |
+
+**Красный режим:** макс. 8 позиций, 30% от стейблов, мин. $50/позиция.
+
+### `llm_router.py` — Маршрутизатор AI
+
+| Режим | Описание |
+|-------|----------|
+| `PERPLEXITY_ONLY` | Только Perplexity (текущий) |
+| `LOCAL_ONLY` | Только Ollama |
+| `HYBRID` | Perplexity → Ollama fallback |
+| `PREFER_LOCAL` | Ollama → Perplexity fallback |
+
+### `stats_service.py` — Статистика
+
+- `get_pnl_by_pairs_report(days)` — PnL по парам (топ-10)
+- `get_pnl_by_days_report(days)` — PnL по дням
+- `get_llm_stats_report(period)` — Perplexity: запросы, стоимость, бюджет
+- `get_positions_status_report()` — Текущие открытые позиции
+
+### `chart_service.py` — Графики
+
+PNG-графики: свечи + TP/SL уровни + стрелки BUY/SELL (matplotlib, Agg backend).
+
+### `error_tracker.py` — Трекер ошибок
+
+Кольцевой буфер (deque, 200 записей). Каждая запись: timestamp, module, error_type, message, traceback.
 
 ---
 
-##  Сканер Top Gainers (динамические пары)
+## 🤖 Telegram интерфейс (aiogram 3.x)
 
-### Как работает:
-1. **Сканер** запускается каждый час + при старте бота.
-2. Получает с Bybit список **Top Gainers** (рост > 1.5%, объем > 1M$).
-3. **24-часовая память**: если монета попала в Топ-5, она остается в списке мониторинга на 24 часа.
-4. Ограничение списка до 10 активных динамических пар.
-5. Обновляет подписки WebSocket.
+### Архитектура
 
-### Путь монеты из Top Gainers:
+**`bot/telegram_aiogram/bot.py`** — класс `AiogramTelegramBot`:
+- `start()` — создание Bot, Dispatcher, запуск polling
+- `stop()` — остановка polling, закрытие сессии
+- `send_message(text, reply_markup)` — отправка сообщения в TELEGRAM_CHAT_ID
+- `send_startup_message(checks)` — стартовое сообщение с главным меню
 
-```
-СКАНЕР находит монету → dynamic_pairs
-       ↓
-CHECK_SIGNALS (каждые 5 мин)
-       ↓
-PRE-FILTER: RSI + Volume (бесплатно)
-       ↓
-Топ-2 кандидата → AI АНАЛИЗ (Perplexity)
-       ↓
-Score ≥ 80 → ОТКРЫТИЕ ПОЗИЦИИ с TP/SL
-       ↓
-МОНИТОРИНГ: Trailing, Breakeven, DCA, Time Exit
-```
+**`bot/telegram_aiogram/handlers.py`** — все обработчики (~709 строк):
+- Авторизация: `TELEGRAM_ALLOWED_USER_IDS` из `.env`
+- Команды: `/start`, `/menu`
+- Callback-обработчики для inline-кнопок
 
-### Отображение в Telegram:
-```
-🎯 Отслеживаемые пары:
-📌 Fix: BTCUSDT, ETHUSDT, SOLUSDT    ← Фиксированные
-🚀 Top: AVAXUSDT, LINKUSDT           ← Динамические (от сканера)
-```
+### Главное меню (Inline Keyboard)
 
-> **Если Top: (нет)** — сканер работает, но не нашёл подходящих монет (рынок спокойный)
+| Кнопка | Callback | Описание |
+|--------|----------|----------|
+| 💼 Статус | `tg:health` | Балансы, позиции, рыночный режим |
+| 🚦 Режим | `tg:regime` | Светофор: BTC 4H EMA200/RSI14 |
+| ⚠️ Ошибки | `tg:errors` | Последние 20 ошибок |
+| 🔁 Сверка | `tg:reconcile` | Запуск reconcile_orphan_orders |
+| 📈 PnL | `tg:pnl` | PnL за 7/30 дней или всё время |
+| 💹 Арбитраж | `tg:arbitrage` | Сканер, открытие арбитража |
+| 🔔 Уведомления | `tg:notifications` | Вкл/выкл уведомлений |
+| 🚨 Алерты | `tg:alerts` | Вкл/выкл критичных алертов |
+
+### Статус (`tg:health`)
+
+- Рыночный режим (Светофор)
+- Балансы (Bybit Unified): монета, всего, к_выводу, не_к_выводу
+- Открытые позиции: пара, кол-во, вход, цена, PnL%
+
+### PnL (`tg:pnl`)
+
+Подменю: 7 дней / 30 дней / Всё время → дата, PnL, количество сделок
+
+### Арбитраж (`tg:arbitrage`)
+
+- Список возможностей (funding rates)
+- Кнопки открытия арбитража для каждой пары
+- Дашборд: открытые позиции, funding PnL
+
+### Уведомления vs Алерты
+
+- **Уведомления** — обычные (открытие/закрытие позиций, сканер)
+- **Алерты** — критичные (⛔️❌⚠️💸) — управляются отдельно
 
 ---
 
-## �💾 Схема базы данных
+## 💾 Схема базы данных
 
 ### Таблицы
 
@@ -185,23 +358,28 @@ Score ≥ 80 → ОТКРЫТИЕ ПОЗИЦИИ с TP/SL
 | `orders` | Ордера (entry, TP, SL) |
 | `trades` | Исполненные сделки |
 | `pnl_history` | История PnL по дням/парам |
-| `llm_requests` | Логи запросов к Perplexity |
-| `settings` | Настройки бота (scanner_enabled, auto_trading) |
+| `daily_pnl` | Дневной PnL (gross, net, commission, slippage) |
+| `llm_requests` | Логи запросов к Perplexity/Ollama |
+| `settings` | Настройки бота (key-value) |
+| `arbitrage_positions` | Арбитражные позиции |
 
 ### positions
 
 | Поле | Тип | Описание |
 |------|-----|----------|
 | `id` | INTEGER PK | ID позиции |
-| `pair` | TEXT | Торговая пара (BTCUSDT) |
+| `pair` | TEXT | Торговая пара |
 | `entry_price` | REAL | Цена входа |
+| `avg_entry_price` | REAL | Средняя цена (после DCA) |
 | `quantity` | REAL | Количество монет |
+| `current_price` | REAL | Текущая цена |
 | `tp_price` | REAL | Take Profit |
 | `sl_price` | REAL | Stop Loss |
 | `status` | TEXT | OPEN / CLOSED |
-| `current_price` | REAL | Текущая цена |
+| `opened_at` / `closed_at` | TEXT | Время |
 | `unrealized_pnl` | REAL | Нереализованный PnL |
-| `avg_entry_price` | REAL | Средняя цена (после DCA) |
+| `unrealized_pnl_percent` | REAL | PnL в % |
+| `realized_pnl` | REAL | Реализованный PnL |
 | `dca_count` | INTEGER | Количество DCA |
 | `breakeven_activated` | INTEGER | Флаг breakeven |
 
@@ -214,154 +392,178 @@ Score ≥ 80 → ОТКРЫТИЕ ПОЗИЦИИ с TP/SL
 | `side` | TEXT | Buy / Sell |
 | `order_type` | TEXT | Market / Limit |
 | `price` | REAL | Цена ордера |
-| `quantity` | REAL | Количество |
+| `quantity` / `filled_quantity` | REAL | Кол-во / исполнено |
+| `avg_fill_price` | REAL | Средняя цена исполнения |
 | `status` | TEXT | New / Filled / Cancelled |
-| `is_tp` | INTEGER | Флаг Take Profit |
-| `is_sl` | INTEGER | Флаг Stop Loss |
+| `is_tp` / `is_sl` | INTEGER | Флаги TP/SL |
 | `position_id` | INTEGER FK | Связь с позицией |
+
+### trades
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `trade_id` | TEXT PK | ID сделки |
+| `order_id` | TEXT FK | Связь с ордером |
+| `position_id` | INTEGER FK | Связь с позицией |
+| `pair` | TEXT | Пара |
+| `side` | TEXT | Buy / Sell |
+| `price` / `quantity` | REAL | Цена / количество |
+| `fee` / `fee_asset` | REAL / TEXT | Комиссия |
+
+### settings (key-value)
+
+| Ключ | Описание |
+|------|----------|
+| `scanner_enabled` | Сканер (0/1) |
+| `auto_trading_enabled` | Авто-торговля (0/1) |
+| `notifications_enabled` | Уведомления (0/1) |
+| `alerts_enabled` | Алерты (0/1) |
+| `ban_pair_{PAIR}` | Бан пары до datetime |
 
 ---
 
-## ⚙️ Конфигурация (`config/trading_config.py`)
+## ⚙️ Конфигурация
 
-### Риск-менеджмент
+### `config/api_config.py`
+
+| Переменная | Описание |
+|------------|----------|
+| `BYBIT_API_KEY` / `BYBIT_API_SECRET` | API ключи (из .env) |
+| `BYBIT_BASE_URL` | `https://api-demo.bybit.com` |
+| `BYBIT_TESTNET` | True если "testnet" в URL |
+| `BYBIT_DEMO` | True если "demo" в URL |
+| `BYBIT_ACCOUNT_TYPE` | `UNIFIED` |
+| `get_pybit_kwargs()` | → `{demo: True}` / `{testnet: True}` / `{testnet: False}` |
+| `get_pybit_ws_public_kwargs()` | demo → `{testnet: False}` (mainnet для public WS) |
+| `TELEGRAM_ALLOWED_USER_IDS` | Список разрешённых user ID |
+
+### `config/trading_config.py`
+
+#### Риск-менеджмент
 
 | Параметр | Значение | Описание |
 |----------|----------|----------|
 | `MAX_RISK_PER_TRADE` | 0.5% | Риск на сделку |
 | `MAX_TOTAL_RISK` | 5% | Общий риск |
 | `MAX_DAILY_LOSS` | 3% | Дневной стоп-лосс |
-| `MAX_OPEN_POSITIONS` | 5 | Макс. открытых позиций |
-| `MAX_ACTIVE_PAIRS` | 3 | Макс. активных пар |
-| `MAX_NEW_TRADES_PER_DAY` | 10 | Макс. сделок в день |
+| `MAX_OPEN_POSITIONS` | 5 | Макс. позиций |
+| `MAX_ACTIVE_PAIRS` | 3 | Макс. пар |
+| `MAX_NEW_TRADES_PER_DAY` | 15 | Макс. сделок/день |
+| `MAX_CONSECUTIVE_LOSSES` | 3 | Пауза после 3 лоссов |
+| `MAX_SLIPPAGE_PERCENT` | 0.2% | Макс. проскальзывание |
 
-### TP/SL/Trailing
+#### TP/SL (ATR-based)
 
 | Параметр | Значение |
 |----------|----------|
-| `DEFAULT_TP_PERCENT` | +2% |
-| `DEFAULT_SL_PERCENT` | -1% |
-| `TRAILING_ACTIVATION` | +1% |
-| `TRAILING_STEP` | 0.5% |
+| `ATR_BASED_TPSL_ENABLED` | True |
+| `ATR_PERIOD` | 14 |
+| `ATR_TIMEFRAME` | "60" (1H) |
+| `ATR_TP_MULTIPLIER` | 3.0 (TP = entry + ATR × 3) |
+| `ATR_SL_MULTIPLIER` | 1.0 (SL = entry - ATR × 1) |
+| `DEFAULT_TP_PERCENT` | +2% (fallback) |
+| `DEFAULT_SL_PERCENT` | -1% (fallback) |
+
+#### Trailing Stop & Breakeven
+
+| Параметр | Значение |
+|----------|----------|
+| `TRAILING_ACTIVATION` | +3% прибыли |
+| `TRAILING_STEP` | 1.5% от цены |
 | `BREAKEVEN_TRIGGER_PERCENT` | +1% |
-| `BREAKEVEN_BUFFER` | +0.1% |
+| `BREAKEVEN_BUFFER` | +0.1% над входом |
 
-### ATR-based TP/SL (**NEW v1.5.0**)
-
-| Параметр | Значение | Описание |
-|----------|----------|----------|
-| `ATR_BASED_TPSL_ENABLED` | True | Адаптивные уровни к волатильности |
-| `ATR_PERIOD` | 14 | Период ATR |
-| `ATR_TP_MULTIPLIER` | 3.0 | TP = ATR × 3 (R/R 1:3) |
-| `ATR_SL_MULTIPLIER` | 1.0 | SL = ATR × 1 |
-
-### Тренд-фильтр (**NEW v1.5.0**)
-
-| Параметр | Значение | Описание |
-|----------|----------|----------|
-| `TREND_FILTER_ENABLED` | True | Не торговать против тренда |
-| `TREND_EMA_FAST` | 20 | Быстрая EMA |
-| `TREND_EMA_SLOW` | 50 | Медленная EMA |
-| **Правило** | | LONG только если EMA20 > EMA50 |
-
-### Пирамидинг (**NEW**)
-
-| Параметр | Значение | Описание |
-|----------|----------|----------|
-| `PYRAMIDING_ENABLED` | True | Включить пирамидинг |
-| `INITIAL_POSITION_PERCENT` | 65% | Первоначальный вход |
-| `PYRAMIDING_TRIGGER` | -0.5% | Триггер для докупки |
-| `PYRAMIDING_ADD_PERCENT` | 35% | Размер докупки |
-
-### TIME EXIT
-
-| Параметр | Значение | Описание |
-|----------|----------|----------|
-| `TIME_EXIT_ENABLED` | True | Включить автозакрытие |
-| `MAX_POSITION_HOURS` | 8ч | Макс. время позиции (было 4ч) |
-| `STALE_MOVE_THRESHOLD` | 0.5% | Мин. движение для удержания |
-
-### DCA (Smart)
+#### Пирамидинг & DCA
 
 | Параметр | Значение |
 |----------|----------|
-| `DCA_ENABLED` | True |
+| `INITIAL_POSITION_PERCENT` | 65% |
+| `PYRAMIDING_TRIGGER` | -0.5% |
+| `PYRAMIDING_ADD_PERCENT` | 35% |
 | `DCA_TRIGGER_PERCENT` | -1.5% |
-| `DCA_MAX_ENTRIES` | 3 |
-| `DCA_MIN_SCORE` | 60 |
+| `DCA_MAX_ENTRIES` | 2 |
+| `DCA_MIN_SCORE` | 50 |
 | `DCA_POSITION_MULTIPLIER` | 0.5 |
 
-### Спот-Фьючерс Арбитраж (**NEW v1.6.0**)
+#### Time Exit
 
-| Параметр | Значение | Описание |
-|----------|----------|----------|
-| `ARBITRAGE_ENABLED` | True | Включить авто-арбитраж |
-| `ARBITRAGE_CHECK_INTERVAL` | 3600 | Проверка каждый час (секунды) |
-| `ARBITRAGE_MIN_FUNDING_RATE` | 0.0001 | Мин. funding rate (0.01%) |
-| `ARBITRAGE_MAX_POSITIONS` | 3 | Максимум арбитражных позиций |
-| `ARBITRAGE_POSITION_SIZE_USD` | 100 | Размер позиции в USDT |
-| `ARBITRAGE_MIN_VOLUME_USDT` | 10M | Мин. объем для подбора пар |
-| `ARBITRAGE_SCAN_LIMIT` | 50 | Лимит сканируемых пар |
+| Параметр | Значение |
+|----------|----------|
+| `MAX_POSITION_HOURS` | 8 |
+| `STALE_MOVE_THRESHOLD` | 0.5% |
 
-### Perplexity
+#### Тренд-фильтр
+
+LONG только если EMA20 > EMA50 (`TREND_FILTER_ENABLED = True`)
+
+#### Арбитраж
+
+| Параметр | Значение |
+|----------|----------|
+| `ARBITRAGE_ENABLED` | True |
+| `ARBITRAGE_CHECK_INTERVAL` | 3600 сек |
+| `ARBITRAGE_MIN_FUNDING_RATE` | 0.01% |
+| `ARBITRAGE_MAX_POSITIONS` | 3 (зелёный) / 8 (красный) |
+| `ARBITRAGE_POSITION_SIZE_USD` | $100 |
+| `ARBITRAGE_RED_TOTAL_ALLOCATION_PCT` | 30% |
+| `ARBITRAGE_RED_MIN_POSITION_SIZE_USD` | $50 |
+
+#### Perplexity AI
 
 | Параметр | Значение |
 |----------|----------|
 | `MAX_LLM_COST_PER_MONTH` | $30 |
 | `MAX_LLM_REQUESTS_PER_DAY` | 100 |
-| Интервал анализа пары | 5 мин |
+| `LLM_PROVIDER_MODE` | PERPLEXITY_ONLY |
+| `THRESHOLD_AUTO_TRADE` | 80 |
+| `THRESHOLD_BUY` | 70 |
+| `THRESHOLD_WAIT` | 50 |
 
 ---
 
-## 🤖 Telegram интерфейс
+## 🔄 Логика работы — диаграммы
 
-### Постоянная клавиатура (ReplyKeyboard)
+### Главный цикл
 
-| Кнопка | Действие |
-|--------|----------|
-| 📊 Анализ | Выбор пары → AI анализ → график |
-| 📈 Отчёты | PnL по дням/парам, AI-отчёты |
-| � Статус | Открытые позиции, балансы |
-| ⚠️ Ошибки | Последние ошибки |
-| ⚙️ Настройки | Пауза, авто-торговля, сканер |
-
----
-
-## 🔄 Логика работы
-
-### Цикл проверки сигналов
-
-```mermaid
-flowchart TD
-    A[_check_signals каждые 5 мин] --> B{Режим PAUSED?}
-    B -->|Да| END[Пропуск]
-    B -->|Нет| C{Авто-торговля ВКЛ?}
-    C -->|Нет| END
-    C -->|Да| D[Фильтруем пары без позиций]
-    D --> E[Pre-filter: RSI + Volume]
-    E --> F[Топ-2 кандидата]
-    F --> G[Perplexity AI анализ]
-    G --> H{Score >= 80?}
-    H -->|Нет| LOG[Логируем отказ]
-    H -->|Да| I[Проверка риск-лимитов]
-    I --> J{Лимиты OK?}
-    J -->|Нет| LOG
-    J -->|Да| K[open_position]
-    K --> L[Telegram уведомление]
+```
+_check_signals() [каждые 10 мин]
+│
+├─ Режим PAUSED? → пропуск
+├─ Авто-торговля выкл? → пропуск
+│
+├─ 🚦 СВЕТОФОР: is_trading_allowed()
+│  └─ КРАСНЫЙ → пропуск новых сделок
+│
+├─ Сбор пар: fixed + dynamic
+│  └─ Исключение: с позициями + забаненные
+│
+├─ PRE-FILTER: scan_and_filter(pairs, top_n=2)
+│  └─ RSI 25-70, Volume >= 1.2x, EMA, MACD → Score → топ-2
+│
+├─ Для каждого кандидата:
+│  ├─ AI: analyze_pair() → score, signal, target, SL
+│  ├─ score >= 80? → ДА
+│  ├─ risk_limits OK? → ДА
+│  ├─ open_position() → Market Buy + TP/SL
+│  └─ Telegram уведомление
+│
+└─ Задержка 2 сек между парами
 ```
 
 ### Жизненный цикл позиции
 
-```mermaid
-flowchart LR
-    OPEN[Открытие] --> MONITOR[Мониторинг]
-    MONITOR --> TP[TP +2%]
-    MONITOR --> SL[SL -1%]
-    MONITOR --> TRAIL[Trailing Stop]
-    MONITOR --> BE[Breakeven]
-    MONITOR --> DCA[DCA докупка]
-    MONITOR --> TIME[Time Exit]
-    TP & SL & TRAIL & BE & TIME --> CLOSE[Закрытие]
+```
+ОТКРЫТИЕ (Market Buy + TP/SL)
+│
+├─ [30 сек] update_prices → PnL
+├─ [30 сек] check_breakeven → SL = entry + 0.1% при +1%
+├─ [30 сек] trailing_stops → SL = цена - 1.5% при +3%
+├─ [2 мин] check_dca → докупка при -1.5%
+├─ [2 мин] auto_sl → создание SL если нет
+├─ [5 мин] time_exit → закрытие при >8ч + <0.5% движения
+├─ [15 сек] emergency_sl → аварийный SL
+│
+└─ ЗАКРЫТИЕ: TP | SL | Trailing | Time Exit | Ручное (Telegram)
 ```
 
 ---
@@ -371,98 +573,30 @@ flowchart LR
 ### Локально
 ```bash
 cd /Users/lexa/Documents/Python/bybit_bot
-source venv/bin/activate
+source .venv/bin/activate
 python -m bot.main
 ```
 
 ### На сервер
 ```bash
-# 1. Создать архив
-zip -r deploy.zip bot/ config/ -x "*.pyc" -x "*__pycache__*"
-
-# 2. Загрузить (scp)
-expect -c 'spawn scp -P 58291 deploy.zip root@217.12.37.42:/root/bybit_bot/ ...'
-
-# 3. Перезапустить
-ssh -p 58291 root@217.12.37.42
-cd /root/bybit_bot
-pkill -f "python.*main.py"
-unzip -o deploy.zip
-./run_bot.sh
+scp -r bot/ config/ bybit-bot:/root/bybit_bot/
+ssh bybit-bot "pkill -f 'bot/main.py'; sleep 2; cd /root/bybit_bot && nohup .venv/bin/python -m bot.main >> logs/run.log 2>&1 &"
 ```
 
-### Проверка логов
+### Проверка
 ```bash
-tail -50 /root/bybit_bot/logs/bot.log
-grep ERROR /root/bybit_bot/logs/bot.log | tail -20
+ssh bybit-bot "tail -50 /root/bybit_bot/logs/bot.log"
+ssh bybit-bot "grep ERROR /root/bybit_bot/logs/bot.log | tail -20"
 ```
 
----
-
-## ✅ История исправлений
-
-### v1.9.0 (2026-01-06)
-- ✅ **DCA Balance Check**: Добавлена проверка доступного USDT перед докупкой, исключает ошибку `Insufficient balance`.
-- ✅ **Improved Rejection Logging**: `open_position` теперь возвращает `(position, error_message)`, детализируя причину отказа.
-- ✅ **Controller Logging**: `_check_signals` логирует конкретную причину отказа (Trend Filter, Risk Limit, API Error).
-- ✅ **Telegram Handlers**: Ручная покупка выводит точную ошибку при неудаче.
-- ✅ **Full Redeploy**: Восстановлен `.venv` на сервере со всеми зависимостями.
-
-### v1.8.0 (2026-01-04)
-- ✅ **Advanced AI Prompt**: Добавлен Web Search (анализ новостей X/Twitter за 6 часов) и поле `LOGIC`.
-- ✅ **LLM Limits**: Дневной лимит запросов увеличен до **100**, бюджет до **$30**.
-- ✅ **Smart Scanner**: Добавлена фильтрация символов по доступности в среде (Testnet-only filtering).
-- ✅ **Server Optimization**: Установлен `sqlite3` на сервер, исправлены зависимости `matplotlib` и `pandas`.
-- ✅ **Improved Parsing**: Парсер Perplexity теперь обрабатывает многострочную логику и адаптирован под низкую температуру (0.2).
-
-### v1.7.0 (2026-01-03)
-- ✅ **LLM Router**: маршрутизатор между провайдерами AI (Perplexity / Ollama)
-- ✅ **Ollama Client**: интеграция с локальной LLM (qwen2.5:1.5b)
-- ✅ **HYBRID режим**: Perplexity + Ollama fallback
-- ✅ Установлен Ollama на сервер (CPU-only)
-- ✅ `LLM_PROVIDER_MODE` в config: PERPLEXITY_ONLY, LOCAL_ONLY, HYBRID, PREFER_LOCAL
-- ✅ **Fix**: Заменено округление `round()` на `math.floor()` для `quantity` во всех сервисах.
-- ✅ Исправлена ошибка `Insufficient balance` при закрытии позиций (из-за округления вверх).
-- ✅ **Арбитраж**: Добавлен динамический сканер ликвидных пар (фильтрация по 24h объему и наличию на обоих рынках).
-- ✅ **Торговый сканер**: Исправлен баг фильтрации (USD/USDT), добавлена 24-часовая "память" для трендовых монет.
-- ✅ **Top Gainers**: Теперь бот мониторит топ-5 волатильных монет и сохраняет их в списке на сутки.
-
-### v1.6.0 (2026-01-03)
-- ✅ **Спот-Фьючерс Арбитраж**: автоматический заработок на funding rates
-- ✅ **Авто-арбитраж**: сканирование и открытие каждый час
-- ✅ **Telegram меню**: кнопка "Арбитраж" со сканером и управлением
-- ✅ **БД**: таблица `arbitrage_positions`
-- ✅ **Scheduler**: обновление funding в 0:00, 8:00, 16:00 UTC
-
-### v1.5.0 (2026-01-02)
-- ✅ **ATR-based TP/SL**: адаптивные уровни к волатильности (ATR×3 / ATR×1)
-- ✅ **R/R 1:3**: улучшенное соотношение риск/прибыль
-- ✅ **Тренд-фильтр**: не торгуем если EMA20 < EMA50
-- ✅ **Position Sizing по AI Score**: размер × (score/80), от 0.5x до 1.2x
-- ✅ Добавлен метод `calculate_atr()` в indicators_service
-
-### v1.4.0 (2026-01-02)
-- ✅ **Пирамидинг входа**: первоначальный вход 65%, докупка при -0.5%
-- ✅ Исправлена ошибка `Order price has too many decimals (170134)` — метод `_format_price()`
-- ✅ Исправлена ошибка `TradesRepository.get_db` — импорт из connection
-- ✅ Отчёты PnL теперь записываются через единый метод `_close_position_with_pnl()`
-- ✅ TIME EXIT увеличен до 8 часов (было 4)
-
-### v1.3.0 (2025-12-30)
-- ✅ Auto-SL теперь **синхронизирует qty в БД** с реальным балансом биржи
-- ✅ При `Insufficient balance` — позиция автоматически **закрывается в БД**
-- ✅ Добавлен метод `update_position_quantity()` в trades_repo
-- ✅ Подробная документация Top Gainers сканера
-
-### v1.2.0 (2025-12-30)
-- ✅ `auto_create_missing_sl()` — автоматическое создание SL для незащищённых позиций
-- ✅ Постоянная клавиатура Telegram (`ReplyKeyboardMarkup`)
-
-### v1.1.0 (2025-12-30)
-- ✅ Исправлена ошибка `Insufficient balance (170131)` — проверка баланса перед продажей
-- ✅ Исправлена ошибка `Order quantity has too many decimals (170137)` — метод `_format_qty()`
-- ✅ Увеличен `recv_window` до 20000 (Read timeout)
-- ✅ Добавлена проверка `scheduler.running` перед остановкой
+### SSH config (`~/.ssh/config`)
+```
+Host bybit-bot
+    HostName 217.12.37.42
+    User root
+    Port 58291
+    IdentityFile ~/.ssh/bybit_bot_ed25519
+```
 
 ---
 
@@ -470,10 +604,12 @@ grep ERROR /root/bybit_bot/logs/bot.log | tail -20
 
 | API | Назначение | Эндпоинт |
 |-----|------------|----------|
-| Bybit REST | Балансы, ордера | `api-testnet.bybit.com/v5/*` |
-| Bybit WS | Цены реалтайм | `stream-testnet.bybit.com/v5/public/spot` |
-| Perplexity | AI-анализ | `api.perplexity.ai/chat/completions` |
-| Telegram | Интерфейс | Bot API |
+| Bybit REST (Demo) | Балансы, ордера | `https://api-demo.bybit.com/v5/*` |
+| Bybit WS Public | Тикеры реалтайм | `wss://stream.bybit.com/v5/public/spot` |
+| Bybit WS Private | Приватные данные | `wss://stream-demo.bybit.com/v5/private` |
+| Perplexity | AI-анализ | `https://api.perplexity.ai/chat/completions` |
+| Ollama | Локальная LLM | `http://localhost:11434/api/generate` |
+| Telegram | Интерфейс | Bot API (aiogram 3.x) |
 
 ---
 
@@ -483,6 +619,7 @@ grep ERROR /root/bybit_bot/logs/bot.log | tail -20
 # Bybit
 BYBIT_API_KEY=...
 BYBIT_API_SECRET=...
+BYBIT_BASE_URL=https://api-demo.bybit.com
 
 # Perplexity
 PERPLEXITY_API_KEY=...
@@ -490,4 +627,61 @@ PERPLEXITY_API_KEY=...
 # Telegram
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
+TELEGRAM_ALLOWED_USER_IDS=6784568
 ```
+
+---
+
+## ⚠️ Известные проблемы и TODO
+
+### Ошибки на сервере (актуальные)
+
+1. **`reconcile_orphan_orders`** — метод вызывается в `controller.py`, но **не реализован** в `position_service.py`. Нужно добавить метод или убрать вызов.
+2. **Demo Trading ограничения** — demo не поддерживает public WebSocket streams, поэтому используется mainnet для public WS (`get_pybit_ws_public_kwargs()`).
+3. **Dust balances** — при продаже мелких остатков (AVAX, LINK) ошибка минимального размера ордера.
+
+### TODO для доработки
+
+- [ ] Реализовать `reconcile_orphan_orders()` в `PositionService`
+- [ ] Добавить веб-дашборд (FastAPI + React)
+- [ ] Улучшить AI промпт (добавить on-chain данные)
+- [ ] Добавить поддержку mainnet (реальная торговля)
+- [ ] Мониторинг здоровья бота (uptime, heartbeat)
+- [ ] Бэкап БД (автоматический)
+
+---
+
+## ✅ История версий
+
+### v2.0.0 (2026-02-09)
+- ✅ Переход на Demo Trading (api-demo.bybit.com) вместо testnet
+- ✅ `get_pybit_kwargs()` / `get_pybit_ws_public_kwargs()` — динамическая конфигурация
+- ✅ Telegram переведён на aiogram 3.x (telegram_aiogram/)
+- ✅ Полная документация PROJECT_STRUCTURE.md
+
+### v1.9.0 (2026-01-06)
+- ✅ DCA Balance Check — проверка USDT перед докупкой
+- ✅ Improved Rejection Logging — `open_position` возвращает `(position, error_message)`
+- ✅ Controller Logging — конкретная причина отказа
+
+### v1.8.0 (2026-01-04)
+- ✅ Advanced AI Prompt — Web Search + поле LOGIC
+- ✅ Smart Scanner — фильтрация по доступности в среде
+
+### v1.7.0 (2026-01-03)
+- ✅ LLM Router (Perplexity / Ollama)
+- ✅ Арбитраж: динамический сканер ликвидных пар
+- ✅ Top Gainers: 24-часовая память
+
+### v1.6.0 (2026-01-03)
+- ✅ Спот-Фьючерс Арбитраж
+- ✅ Telegram меню арбитража
+- ✅ Funding updates: 0:00, 8:00, 16:00 UTC
+
+### v1.5.0 (2026-01-02)
+- ✅ ATR-based TP/SL (R/R 1:3)
+- ✅ Тренд-фильтр (EMA20/EMA50)
+- ✅ Position Sizing по AI Score
+
+### v1.4.0 — v1.1.0
+- Пирамидинг, Auto-SL, Breakeven, Time Exit, форматирование qty/price

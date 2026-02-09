@@ -3,11 +3,10 @@
 """
 from typing import List, Optional
 from datetime import datetime, timedelta
-import asyncio
 import math
 from pybit.unified_trading import HTTP
 from config.settings import logger, TIMEZONE
-from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_ACCOUNT_TYPE, get_pybit_kwargs
+from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET
 from config.trading_config import (
     TRAILING_ACTIVATION, TRAILING_STEP,
     BREAKEVEN_ENABLED, BREAKEVEN_TRIGGER_PERCENT, BREAKEVEN_BUFFER,
@@ -40,7 +39,7 @@ class PositionService:
     
     def __init__(self):
         self.client = HTTP(
-            **get_pybit_kwargs(),
+            testnet=True,
             api_key=BYBIT_API_KEY,
             api_secret=BYBIT_API_SECRET,
             recv_window=20000  # Увеличенный timeout для стабильности
@@ -103,9 +102,8 @@ class PositionService:
         """
         try:
             base_coin = self._get_base_coin(pair)
-            account_type = "UNIFIED" if str(BYBIT_ACCOUNT_TYPE).upper() == "UNIFIED" else "SPOT"
             wallet = self.client.get_wallet_balance(
-                accountType=account_type,
+                accountType="UNIFIED",
                 coin=base_coin
             )
             
@@ -113,23 +111,10 @@ class PositionService:
                 coins = wallet['result']['list'][0].get('coin', [])
                 for coin in coins:
                     if coin['coin'] == base_coin:
-                        def _safe_float(v) -> float:
-                            if v is None:
-                                return 0.0
-                            if isinstance(v, (int, float)):
-                                return float(v)
-                            s = str(v).strip()
-                            if s == "":
-                                return 0.0
-                            try:
-                                return float(s)
-                            except Exception:
-                                return 0.0
-
                         # Используем 'free' (доступный для торговли) вместо 'walletBalance'
                         # free = доступно для торговли, walletBalance = общий баланс
-                        free_balance = _safe_float(coin.get('free', 0) or coin.get('availableToWithdraw', 0) or 0)
-                        wallet_balance = _safe_float(coin.get('walletBalance', 0))
+                        free_balance = float(coin.get('free', 0) or coin.get('availableToWithdraw', 0) or 0)
+                        wallet_balance = float(coin.get('walletBalance', 0))
                         
                         logger.debug(f"Баланс {base_coin}: free={free_balance}, wallet={wallet_balance}")
                         
@@ -139,28 +124,6 @@ class PositionService:
         except Exception as e:
             logger.debug(f"Ошибка получения баланса {pair}: {e}")
             return -1  # -1 означает ошибку, не 0
-
-    async def _cancel_exchange_open_orders_for_symbol(self, pair: str) -> None:
-        try:
-            resp = self.client.get_open_orders(category="spot", symbol=pair)
-            if resp.get('retCode') != 0:
-                return
-
-            orders = (((resp.get('result') or {}).get('list')) or [])
-            for o in orders:
-                order_id = o.get('orderId') or o.get('order_id')
-                if not order_id:
-                    continue
-                try:
-                    self.client.cancel_order(
-                        category="spot",
-                        symbol=pair,
-                        orderId=str(order_id)
-                    )
-                except Exception:
-                    continue
-        except Exception:
-            return
 
     async def sync_orders_and_trades(self, max_orders: int = 50) -> None:
         open_orders = self.trades_repo.get_open_orders()
@@ -211,17 +174,6 @@ class PositionService:
 
                         if status:
                             self.trades_repo.update_order_status(order_id, status, filled_qty=filled_qty, avg_price=avg_price)
-                    else:
-                        open_resp = self.client.get_open_orders(
-                            category="spot",
-                            symbol=pair
-                        )
-
-                        if open_resp.get('retCode') == 0:
-                            open_list = (((open_resp.get('result') or {}).get('list')) or [])
-                            found_open = any((o.get('orderId') == order_id) for o in open_list)
-                            if not found_open:
-                                self.trades_repo.update_order_status(order_id, 'Cancelled')
 
                 executions = self.client.get_executions(
                     category="spot",
@@ -267,85 +219,7 @@ class PositionService:
 
             except Exception as e:
                 logger.debug(f"sync_orders_and_trades error for {pair} {order_id}: {e}")
-
-    async def reconcile_orphan_orders(self) -> List[str]:
-        """
-        Сверка ордеров: биржа vs БД.
-        1. Ордер есть на бирже, но нет в БД → отменить на бирже (сирота)
-        2. Ордер есть в БД (New/PartiallyFilled), но нет на бирже → пометить Cancelled
-        Returns: Список сообщений о действиях
-        """
-        messages = []
-
-        # --- Шаг 1: получить все открытые ордера на бирже (spot) ---
-        exchange_orders = {}  # {order_id: order_dict}
-        try:
-            resp = self.client.get_open_orders(category="spot")
-            if resp.get('retCode') == 0:
-                for o in (resp.get('result', {}).get('list') or []):
-                    oid = o.get('orderId')
-                    if oid:
-                        exchange_orders[oid] = o
-        except Exception as e:
-            logger.error(f"❌ reconcile: ошибка получения ордеров с биржи: {e}")
-            return [f"❌ Ошибка получения ордеров: {e}"]
-
-        # --- Шаг 2: получить открытые ордера из БД ---
-        db_orders = self.trades_repo.get_open_orders()  # status IN ('New','PartiallyFilled')
-        db_order_ids = {o['order_id'] for o in db_orders}
-
-        # --- Шаг 3: сироты на бирже (есть на бирже, нет в БД) → отменить ---
-        for oid, exo in exchange_orders.items():
-            if oid not in db_order_ids:
-                pair = exo.get('symbol', '???')
-                try:
-                    cancel_resp = self.client.cancel_order(category="spot", symbol=pair, orderId=oid)
-                    if cancel_resp.get('retCode') == 0:
-                        msg = f"🗑️ Orphan cancelled: {pair} order {oid}"
-                    else:
-                        msg = f"⚠️ Orphan cancel failed: {pair} {oid} — {cancel_resp.get('retMsg', '')}"
-                    logger.warning(msg)
-                    messages.append(msg)
-                except Exception as e:
-                    msg = f"❌ Orphan cancel error: {pair} {oid} — {e}"
-                    logger.error(msg)
-                    messages.append(msg)
-
-        # --- Шаг 4: пропавшие ордера (есть в БД, нет на бирже) → проверить историю ---
-        exchange_oid_set = set(exchange_orders.keys())
-        for db_order in db_orders:
-            oid = db_order['order_id']
-            if oid in exchange_oid_set:
-                continue  # ордер жив на бирже, всё ок
-
-            pair = db_order.get('pair', '???')
-            try:
-                hist = self.client.get_order_history(category="spot", symbol=pair, orderId=oid)
-                if hist.get('retCode') == 0:
-                    items = (hist.get('result', {}).get('list') or [])
-                    if items:
-                        status = items[0].get('orderStatus', 'Cancelled')
-                        filled_qty_raw = items[0].get('cumExecQty')
-                        avg_price_raw = items[0].get('avgPrice')
-                        filled_qty = float(filled_qty_raw) if filled_qty_raw else None
-                        avg_price = float(avg_price_raw) if avg_price_raw else None
-                        self.trades_repo.update_order_status(oid, status, filled_qty=filled_qty, avg_price=avg_price)
-                        msg = f"📋 Order {pair} {oid}: DB→{status} (filled={filled_qty})"
-                        logger.info(msg)
-                        messages.append(msg)
-                    else:
-                        self.trades_repo.update_order_status(oid, 'Cancelled')
-                        msg = f"📋 Order {pair} {oid}: не найден → Cancelled"
-                        logger.info(msg)
-                        messages.append(msg)
-            except Exception as e:
-                logger.debug(f"reconcile history check error {pair} {oid}: {e}")
-
-        if not messages:
-            messages.append("✅ Reconcile: расхождений не найдено")
-
-        return messages
-
+    
     def _close_position_with_pnl(self, position_id: int, pair: str, 
                                    exit_price: float, realized_pnl: float) -> None:
         """
@@ -360,7 +234,7 @@ class PositionService:
         is_win = realized_pnl > 0
         self.pnl_repo.record_daily_pnl(today, pair, realized_pnl, is_win)
         
-        logger.debug(f" PnL записан: {pair} | {realized_pnl:.2f}")
+        logger.debug(f"📊 PnL записан: {pair} | {realized_pnl:.2f}")
 
     async def update_positions_prices(self) -> None:
         """Обновить текущие цены всех открытых позиций (через WS)"""
@@ -412,7 +286,7 @@ class PositionService:
                         # 1. Находим активный SL ордер
                         sl_order = self.trades_repo.get_sl_order(pos['id'])
                         if not sl_order:
-                            logger.warning(f" Нет активного SL ордера для {pair} (ID: {pos['id']})")
+                            logger.warning(f"⚠️ Нет активного SL ордера для {pair} (ID: {pos['id']})")
                             continue
                             
                         # 2. Изменяем ордер на бирже
@@ -428,14 +302,14 @@ class PositionService:
                             self.trades_repo.set_position_tpsl(pos['id'], sl_price=new_sl)
                             self.trades_repo.update_order_price(sl_order['order_id'], new_sl)
                             
-                            msg = f" SL по {pair} подтянут до {new_sl:.4f} (Прибыль: {profit_pct*100:.2f}%)"
+                            msg = f"🔄 SL по {pair} подтянут до {new_sl:.4f} (Прибыль: {profit_pct*100:.2f}%)"
                             logger.info(msg)
                             messages.append(msg)
                         else:
-                            logger.error(f" Ошибка изменения SL {pair}: {response['retMsg']}")
+                            logger.error(f"❌ Ошибка изменения SL {pair}: {response['retMsg']}")
                             
                     except Exception as e:
-                        logger.error(f" Ошибка Trailing Stop {pair}: {e}")
+                        logger.error(f"❌ Ошибка Trailing Stop {pair}: {e}")
         
         return messages
 
@@ -444,7 +318,7 @@ class PositionService:
         position = self.trades_repo.get_position_by_id(position_id)
         
         if not position or position['status'] != 'OPEN':
-            logger.warning(f" Позиция {position_id} не найдена или уже закрыта")
+            logger.warning(f"⚠️ Позиция {position_id} не найдена или уже закрыта")
             return False
         
         pair = position['pair']
@@ -452,10 +326,6 @@ class PositionService:
         entry_price = position['entry_price']
         
         try:
-            await self._cancel_position_orders(position_id)
-            await self._cancel_exchange_open_orders_for_symbol(pair)
-            await asyncio.sleep(0.5)
-
             # Получаем текущую цену
             ticker = self.client.get_tickers(category="spot", symbol=pair)
             current_price = float(ticker['result']['list'][0]['lastPrice'])
@@ -485,12 +355,7 @@ class PositionService:
                         )
                         logger.info(f"✅ Продано остаток: {sell_qty} {self._get_base_coin(pair)}")
                     except Exception as e:
-                        err_str = str(e)
-                        # Min order size / dust — просто игнорируем, закроем в БД
-                        if '170217' in err_str or 'MIN_NOTIONAL' in err_str or 'too small' in err_str.lower():
-                            logger.info(f"🧹 Dust {pair}: остаток слишком мал для продажи, закрываем в БД")
-                        else:
-                            logger.debug(f"Не удалось продать остаток: {e}")
+                        logger.debug(f"Не удалось продать остаток: {e}")
                 
                 # Закрываем позицию в БД с приблизительным PnL
                 realized_pnl = (current_price - entry_price) * actual_balance
@@ -499,8 +364,10 @@ class PositionService:
                 return True
             # ====== КОНЕЦ НОВОЙ ЛОГИКИ ======
             
+            # Форматируем qty правильно (без лишних decimals)
             formatted_qty = self._format_qty(pair, quantity)
-
+            
+            # Размещаем рыночный ордер на продажу
             order_response = self.client.place_order(
                 category="spot",
                 symbol=pair,
@@ -511,27 +378,8 @@ class PositionService:
             )
             
             if order_response['retCode'] != 0:
-                if order_response.get('retCode') == 170131 or 'Insufficient balance' in str(order_response.get('retMsg', '')):
-                    actual_balance = self._get_actual_balance(pair)
-                    if actual_balance > 0:
-                        formatted_qty = self._format_qty(pair, actual_balance)
-                        order_response = self.client.place_order(
-                            category="spot",
-                            symbol=pair,
-                            side="Sell",
-                            orderType="Market",
-                            qty=formatted_qty,
-                            marketUnit="baseCoin"
-                        )
-                        if order_response.get('retCode') != 0:
-                            logger.error(f"❌ Ошибка закрытия: {order_response['retMsg']}")
-                            return False
-                    else:
-                        logger.error(f"❌ Ошибка закрытия: {order_response['retMsg']}")
-                        return False
-                else:
-                    logger.error(f"❌ Ошибка закрытия: {order_response['retMsg']}")
-                    return False
+                logger.error(f"❌ Ошибка закрытия: {order_response['retMsg']}")
+                return False
             
             # Расчёт PnL
             realized_pnl = (current_price - entry_price) * quantity
@@ -541,6 +389,7 @@ class PositionService:
             
             logger.info(f"✅ Позиция закрыта: {pair} | PnL: {realized_pnl:.2f} | Причина: {reason}")
             
+            # Отменяем открытые TP/SL ордера
             await self._cancel_position_orders(position_id)
             
             return True
@@ -579,38 +428,6 @@ class PositionService:
                     
         except Exception as e:
             logger.error(f"❌ Ошибка отмены ордеров: {e}")
-
-    async def emergency_sl_watchdog(self) -> List[str]:
-        messages = []
-        try:
-            await self.update_positions_prices()
-        except Exception:
-            pass
-
-        open_positions = self.trades_repo.get_open_positions()
-        for pos in open_positions:
-            try:
-                position_id = pos['id']
-                pair = pos['pair']
-                sl_price = pos.get('sl_price')
-                current_price = pos.get('current_price')
-
-                if not sl_price or sl_price <= 0:
-                    continue
-                if not current_price or current_price <= 0:
-                    continue
-
-                if current_price <= sl_price:
-                    closed = await self.close_position(position_id, reason="emergency_sl")
-                    if closed:
-                        msg = f"🛑 EMERGENCY SL {pair}: цена {current_price:.4f} <= SL {sl_price:.4f} — закрыто маркетом"
-                        logger.warning(msg)
-                        messages.append(msg)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка emergency SL watchdog: {e}")
-
-        return messages
     
     async def check_breakeven(self) -> List[str]:
         """

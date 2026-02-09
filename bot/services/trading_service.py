@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import math
 from pybit.unified_trading import HTTP
 from config.settings import logger, TIMEZONE
-from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET
+from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, get_pybit_kwargs
 from config.trading_config import (
     MAX_RISK_PER_TRADE,
     MAX_TOTAL_RISK,
@@ -46,7 +46,7 @@ class TradingService:
     
     def __init__(self):
         self.client = HTTP(
-            testnet=BYBIT_TESTNET,
+            **get_pybit_kwargs(),
             api_key=BYBIT_API_KEY,
             api_secret=BYBIT_API_SECRET,
             recv_window=20000  # Увеличенный timeout

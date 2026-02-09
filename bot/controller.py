@@ -4,7 +4,7 @@
 import asyncio
 import time
 from typing import Dict, List
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -19,7 +19,12 @@ from config.trading_config import (
     ARBITRAGE_CHECK_INTERVAL,
     ARBITRAGE_MIN_FUNDING_RATE,
     ARBITRAGE_MAX_POSITIONS,
-    ARBITRAGE_POSITION_SIZE_USD
+    ARBITRAGE_POSITION_SIZE_USD,
+    ARBITRAGE_RED_MODE_ENABLED,
+    ARBITRAGE_RED_MAX_POSITIONS,
+    ARBITRAGE_RED_TOTAL_ALLOCATION_PCT,
+    ARBITRAGE_RED_MIN_POSITION_SIZE_USD,
+    MAX_SLIPPAGE_PERCENT
 )
 from .db.connection import db
 from .services.analysis_service import analysis_service
@@ -30,7 +35,11 @@ from .services.scanner_service import scanner_service
 from .services.websocket_service import websocket_service
 from .services.prefilter_service import prefilter_service
 from .services.arbitrage_service import arbitrage_service
+from .services.market_regime_service import market_regime_service
 from .perplexity_client import perplexity_client
+
+
+BOT_VERSION = "v2.1.0"
 
 
 class BotController:
@@ -39,9 +48,11 @@ class BotController:
     def __init__(self):
         self.scheduler = AsyncIOScheduler(timezone=TIMEZONE)
         self.mode = "ACTIVE"  # ACTIVE, RISK_ONLY, PAUSED
-        self.mode = "ACTIVE"  # ACTIVE, RISK_ONLY, PAUSED
         self.auto_trading_enabled = True
         self.scanner_enabled = False  # По умолчанию выключен
+        self.notifications_enabled = True
+        self.alerts_enabled = True
+        self.started_at: datetime = datetime.now(TIMEZONE)
         
         # Пары
         self.trading_service = trading_service
@@ -64,11 +75,90 @@ class BotController:
 
     async def _send_notification(self, message: str):
         """Отправить уведомление если callback установлен"""
+        try:
+            is_alert = self._is_alert_message(message)
+            if is_alert and not self.alerts_enabled:
+                return
+            if (not is_alert) and (not self.notifications_enabled):
+                return
+        except Exception:
+            pass
+
         if self.notification_callback:
             try:
                 await self.notification_callback(message)
             except Exception as e:
                 logger.error(f"❌ Ошибка отправки уведомления: {e}")
+
+    @staticmethod
+    def _is_alert_message(message: str) -> bool:
+        if not message:
+            return False
+
+        # Простая классификация: критичные сообщения/алерты
+        alert_prefixes = (
+            "⛔️",
+            "❌",
+            "⚠️",
+            "💸",
+        )
+        return message.startswith(alert_prefixes)
+
+    def _ban_key(self, pair: str) -> str:
+        return f"ban_pair_{pair}"
+
+    def _is_pair_banned(self, pair: str) -> bool:
+        try:
+            with db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM settings WHERE key = ?", (self._ban_key(pair),))
+                row = cursor.fetchone()
+                if not row or not row[0]:
+                    return False
+                ban_until = datetime.fromisoformat(row[0])
+                if ban_until.tzinfo is None:
+                    ban_until = ban_until.replace(tzinfo=TIMEZONE)
+                return datetime.now(TIMEZONE) < ban_until
+        except Exception:
+            return False
+
+    def _record_slippage_event(self, pair: str, action: str, slippage: float) -> int:
+        """Записать событие превышения slippage. Возвращает число превышений за 24ч."""
+        try:
+            now = datetime.now(TIMEZONE)
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            with db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO slippage_events (pair, action, slippage, created_at) VALUES (?, ?, ?, ?)",
+                    (pair, action, float(slippage), now.isoformat()),
+                )
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM slippage_events WHERE pair = ? AND created_at >= ?",
+                    (pair, cutoff),
+                )
+                row = cursor.fetchone()
+                return int(row[0] if row else 0)
+        except Exception:
+            return 0
+
+    async def _ban_pair_for_slippage(self, pair: str, exceed_count_24h: int) -> None:
+        """Забанить пару на 24ч и уведомить."""
+        if self._is_pair_banned(pair):
+            return
+        ban_until = datetime.now(TIMEZONE) + timedelta(hours=24)
+        try:
+            with db.transaction() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (self._ban_key(pair), ban_until.isoformat()),
+                )
+        except Exception:
+            return
+
+        await self._send_notification(
+            f"⛔️ {pair} заблокирована на 24ч из-за slippage (превышений за 24ч: {exceed_count_24h})\nДо: {ban_until.isoformat()}"
+        )
     
     async def start(self):
         """Запустить контроллер и планировщик"""
@@ -113,7 +203,78 @@ class BotController:
         db.close()
         
         logger.info("✅ Контроллер остановлен")
-    
+
+    async def panic_sell_all(self) -> List[str]:
+        """
+        🚨 PANIC SELL: экстренная остановка.
+        1. Отменить ВСЕ ордера на бирже
+        2. Закрыть ВСЕ открытые позиции по рынку
+        3. Закрыть ВСЕ арбитражные позиции
+        4. Поставить бота на PAUSE
+        Returns: Список сообщений о действиях
+        """
+        messages = ["🚨 PANIC SELL запущен!"]
+        logger.warning("🚨 PANIC SELL: экстренная остановка")
+
+        # 1. Пауза бота
+        self.mode = "PAUSED"
+        self.auto_trading_enabled = False
+        messages.append("⏸️ Бот переведён в PAUSED")
+
+        # 2. Отмена всех ордеров на бирже
+        try:
+            resp = self.position_service.client.cancel_all_orders(category="spot")
+            if resp.get('retCode') == 0:
+                messages.append("✅ Все спот-ордера отменены")
+            else:
+                messages.append(f"⚠️ Отмена спот-ордеров: {resp.get('retMsg', '?')}")
+        except Exception as e:
+            messages.append(f"❌ Ошибка отмены спот-ордеров: {e}")
+
+        try:
+            resp = self.position_service.client.cancel_all_orders(category="linear")
+            if resp.get('retCode') == 0:
+                messages.append("✅ Все фьючерс-ордера отменены")
+            else:
+                messages.append(f"⚠️ Отмена фьючерс-ордеров: {resp.get('retMsg', '?')}")
+        except Exception as e:
+            messages.append(f"❌ Ошибка отмены фьючерс-ордеров: {e}")
+
+        # 3. Закрытие всех открытых позиций (спот)
+        open_positions = self.position_service.trades_repo.get_open_positions()
+        for pos in open_positions:
+            try:
+                closed = await self.position_service.close_position(pos['id'], reason="panic_sell")
+                if closed:
+                    messages.append(f"✅ Закрыта: {pos['pair']}")
+                else:
+                    messages.append(f"⚠️ Не удалось закрыть: {pos['pair']}")
+            except Exception as e:
+                messages.append(f"❌ Ошибка закрытия {pos['pair']}: {e}")
+
+        # 4. Закрытие арбитражных позиций
+        try:
+            from .db.arbitrage_repo import ArbitrageRepository
+            arb_repo = ArbitrageRepository()
+            arb_positions = arb_repo.get_open_positions()
+            for arb in arb_positions:
+                try:
+                    await arbitrage_service.close_arbitrage(arb['id'])
+                    messages.append(f"✅ Арбитраж закрыт: {arb.get('pair', '?')}")
+                except Exception as e:
+                    messages.append(f"❌ Ошибка закрытия арбитража: {e}")
+        except Exception as e:
+            messages.append(f"⚠️ Арбитраж: {e}")
+
+        # 5. Обновляем ордера в БД
+        db_open_orders = self.position_service.trades_repo.get_open_orders()
+        for order in db_open_orders:
+            self.position_service.trades_repo.update_order_status(order['order_id'], 'Cancelled')
+
+        messages.append("🏁 PANIC SELL завершён. Бот на паузе.")
+        logger.warning("🏁 PANIC SELL завершён")
+        return messages
+
     def _setup_scheduler(self):
         """Настроить задачи планировщика"""
         
@@ -160,6 +321,15 @@ class BotController:
             name='Sync Orders/Trades',
             max_instances=1
         )
+
+        # Reconciliation orphan orders (каждые 5 часов)
+        self.scheduler.add_job(
+            self._reconcile_orphan_orders,
+            trigger=IntervalTrigger(hours=5),
+            id='reconcile_orphans',
+            name='Reconcile Orphan Orders',
+            max_instances=1
+        )
         
         # 5. Trailing Stop (каждые 30 секунд)
         self.scheduler.add_job(
@@ -203,6 +373,14 @@ class BotController:
             trigger=CronTrigger(hour=0, minute=0, timezone=TIMEZONE),
             id='reset_daily',
             name='Сброс дневных лимитов',
+            max_instances=1
+        )
+
+        self.scheduler.add_job(
+            self._update_daily_pnl_utc,
+            trigger=CronTrigger(hour=0, minute=0, timezone='UTC'),
+            id='daily_pnl_utc',
+            name='Daily PnL UTC',
             max_instances=1
         )
         
@@ -252,6 +430,59 @@ class BotController:
             )
         
         logger.info("📅 Планировщик настроен")
+
+    async def _update_daily_pnl_utc(self):
+        try:
+            from .db.daily_pnl_repo import DailyPnLRepository
+            from .db.trades_repo import TradesRepository
+
+            now_utc = datetime.now(timezone.utc)
+            day_end = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_start = day_end - timedelta(days=1)
+            date_utc = day_start.date().isoformat()
+
+            closed_positions = TradesRepository.get_closed_positions_between_utc(day_start, day_end)
+
+            gross_pnl = 0.0
+            net_pnl = 0.0
+            commission_paid = 0.0
+            slippage = 0.0
+            trades_count = 0
+            wins = 0
+            losses = 0
+
+            for pos in closed_positions:
+                gp = float(pos.get('gross_pnl') or 0)
+                np = float(pos.get('net_pnl') or pos.get('realized_pnl') or 0)
+                fee = float(pos.get('commission_paid') or 0)
+                slip = float(pos.get('slippage') or 0)
+
+                gross_pnl += gp
+                net_pnl += np
+                commission_paid += fee
+                slippage += slip
+                trades_count += 1
+                if np > 0:
+                    wins += 1
+                elif np < 0:
+                    losses += 1
+
+            DailyPnLRepository.upsert_day(
+                date_utc=date_utc,
+                gross_pnl=gross_pnl,
+                net_pnl=net_pnl,
+                commission_paid=commission_paid,
+                slippage=slippage,
+                trades_count=trades_count,
+                wins=wins,
+                losses=losses,
+            )
+
+            logger.info(
+                f"📅 daily_pnl UTC сохранён: {date_utc} | net={net_pnl:.2f} | trades={trades_count}"
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка daily_pnl UTC: {e}")
     
     # ========== ПЕРИОДИЧЕСКИЕ ЗАДАЧИ ==========
     
@@ -271,6 +502,12 @@ class BotController:
         
         if not self.auto_trading_enabled:
             logger.debug("🔕 Авто-торговля отключена")
+            return
+
+        # MARKET REGIME FILTER (4H, Variant B): полный запрет новых сделок в плохом режиме
+        allowed, regime_reason = market_regime_service.is_trading_allowed()
+        if not allowed:
+            logger.info(f"🚦 {regime_reason}. Пропускаем поиск сигналов.")
             return
         
         logger.info("🔍 Этап 1: Pre-filter (технический анализ)...")
@@ -323,6 +560,19 @@ class BotController:
                             logger.info(f"✅ Позиция открыта: {pair}")
                             msg = f"✅ Позиция открыта: {pair} @ ${position['entry_price']:.4f}"
                             await self._send_notification(msg)
+
+                            try:
+                                slip = float(position.get('slippage') or 0)
+                                if abs(slip) > MAX_SLIPPAGE_PERCENT:
+                                    await self._send_notification(
+                                        f"💸 Проскальзывание {pair}: {slip*100:.2f}% > {MAX_SLIPPAGE_PERCENT*100:.2f}%"
+                                    )
+
+                                    exceed = self._record_slippage_event(pair, "OPEN", slip)
+                                    if exceed >= 3:
+                                        await self._ban_pair_for_slippage(pair, exceed)
+                            except Exception:
+                                pass
                             break
                         else:
                             # Логируем отказ с конкретной причиной из open_position
@@ -393,6 +643,14 @@ class BotController:
             await self.position_service.sync_orders_and_trades()
         except Exception as e:
             logger.error(f"❌ Ошибка синхронизации ордеров: {e}")
+
+    async def _reconcile_orphan_orders(self):
+        try:
+            messages = await self.position_service.reconcile_orphan_orders()
+            for msg in messages:
+                await self._send_notification(msg)
+        except Exception as e:
+            logger.error(f"❌ Ошибка reconciliation: {e}")
             
     async def _update_trailing_stops(self):
         """Обновление трейлинг-стопов"""
@@ -449,10 +707,10 @@ class BotController:
             open_positions = trades_repo.get_open_positions()
             
             for pos in open_positions:
-                # Проверяем, нужна ли докупка
-                if self.trading_service.check_dca_trigger(pos):
+                action = self.trading_service.get_add_action(pos)
+                if action:
                     pair = pos['pair']
-                    logger.info(f"📉 DCA триггер для {pair}, запрашиваем анализ...")
+                    logger.info(f"📉 {action} триггер для {pair}, запрашиваем анализ...")
                     
                     # Запрашиваем свежий анализ
                     analysis = await self.analysis_service.analyze_pair(pair, use_cache=False)
@@ -461,8 +719,22 @@ class BotController:
                         result = await self.trading_service.add_to_position(pos['id'], analysis)
                         
                         if result:
-                            msg = f"➕ DCA {pair}: докупка #{result['dca_count']} | Новая средняя: ${result['new_avg']:.4f}"
+                            label = result.get('action') or action
+                            msg = f"➕ {label} {pair}: докупка | Новая средняя: ${result['new_avg']:.4f}"
                             await self._send_notification(msg)
+
+                            try:
+                                slip = float(result.get('slippage') or 0)
+                                if abs(slip) > MAX_SLIPPAGE_PERCENT:
+                                    await self._send_notification(
+                                        f"💸 Проскальзывание {pair} ({label}): {slip*100:.2f}% > {MAX_SLIPPAGE_PERCENT*100:.2f}%"
+                                    )
+
+                                    exceed = self._record_slippage_event(pair, str(label), slip)
+                                    if exceed >= 3:
+                                        await self._ban_pair_for_slippage(pair, exceed)
+                            except Exception:
+                                pass
                             
         except Exception as e:
             logger.error(f"❌ Ошибка Smart DCA: {e}")
@@ -551,6 +823,24 @@ class BotController:
                     # По умолчанию уже True в __init__, можно явно сохранить или оставить как есть
                     pass
 
+                # 3. Notifications
+                cursor.execute("SELECT value FROM settings WHERE key = 'notifications_enabled'")
+                row = cursor.fetchone()
+                if row:
+                    self.notifications_enabled = row[0] == '1'
+                    logger.info(
+                        f"⚙️ Загружена настройка уведомлений: {'ВКЛ' if self.notifications_enabled else 'ВЫКЛ'}"
+                    )
+
+                # 4. Alerts
+                cursor.execute("SELECT value FROM settings WHERE key = 'alerts_enabled'")
+                row = cursor.fetchone()
+                if row:
+                    self.alerts_enabled = row[0] == '1'
+                    logger.info(
+                        f"⚙️ Загружена настройка алертов: {'ВКЛ' if self.alerts_enabled else 'ВЫКЛ'}"
+                    )
+
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки настроек: {e}")
 
@@ -558,7 +848,8 @@ class BotController:
         """Получить общий список активных пар"""
         # Объединяем и убираем дубликаты (сохраняя порядок)
         all_pairs = self.fixed_pairs + self.dynamic_pairs
-        return list(dict.fromkeys(all_pairs))
+        unique_pairs = list(dict.fromkeys(all_pairs))
+        return [p for p in unique_pairs if not self._is_pair_banned(p)]
 
     def is_scanner_enabled(self) -> bool:
         """Проверить статус сканера"""
@@ -627,6 +918,48 @@ class BotController:
         logger.info(f"🔄 Авто-торговля {status}")
         
         return self.auto_trading_enabled
+
+    def is_notifications_enabled(self) -> bool:
+        """Проверить, включены ли уведомления в Telegram"""
+        return self.notifications_enabled
+
+    def toggle_notifications(self) -> bool:
+        """Переключить уведомления в Telegram"""
+        self.notifications_enabled = not self.notifications_enabled
+
+        try:
+            with db.transaction() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    ('notifications_enabled', '1' if self.notifications_enabled else '0')
+                )
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения settings.notifications_enabled: {e}")
+
+        status = "включены" if self.notifications_enabled else "выключены"
+        logger.info(f"🔔 Уведомления {status}")
+        return self.notifications_enabled
+
+    def is_alerts_enabled(self) -> bool:
+        """Проверить, включены ли алерты в Telegram"""
+        return self.alerts_enabled
+
+    def toggle_alerts(self) -> bool:
+        """Переключить алерты в Telegram"""
+        self.alerts_enabled = not self.alerts_enabled
+
+        try:
+            with db.transaction() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    ('alerts_enabled', '1' if self.alerts_enabled else '0')
+                )
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения settings.alerts_enabled: {e}")
+
+        status = "включены" if self.alerts_enabled else "выключены"
+        logger.info(f"🚨 Алерты {status}")
+        return self.alerts_enabled
     
     # ========== АВТО-АРБИТРАЖ ==========
     
@@ -636,10 +969,59 @@ class BotController:
             return
         
         try:
+            # В красном режиме (Светофор) усиливаем арбитраж, чтобы капитал не простаивал
+            max_positions = ARBITRAGE_MAX_POSITIONS
+            position_size_usd = ARBITRAGE_POSITION_SIZE_USD
+            try:
+                allowed, _ = market_regime_service.is_trading_allowed()
+                is_red = not bool(allowed)
+            except Exception:
+                is_red = False
+
+            if ARBITRAGE_RED_MODE_ENABLED and is_red:
+                max_positions = int(ARBITRAGE_RED_MAX_POSITIONS)
+                # percent-based sizing: allocate up to X% of stable deposit (USDT+USDC)
+                try:
+                    balances = balance_service.get_wallet_balance() or {}
+                    usdt_total = float((balances.get("USDT") or {}).get("total") or 0)
+                    usdc_total = float((balances.get("USDC") or {}).get("total") or 0)
+                    stable_total = usdt_total + usdc_total
+                except Exception:
+                    stable_total = 0.0
+
+                # Current arbitrage notional (approx): sum(entry_price * qty) for OPEN positions
+                try:
+                    dash = arbitrage_service.get_dashboard()
+                    current_arb_value = float(dash.get("total_value") or 0)
+                except Exception:
+                    current_arb_value = 0.0
+
+                total_allocation = max(0.0, stable_total * float(ARBITRAGE_RED_TOTAL_ALLOCATION_PCT))
+                remaining_allocation = max(0.0, total_allocation - current_arb_value)
+
+                remaining_slots = max(0, max_positions - len(arbitrage_service.repo.get_open_positions()))
+                if remaining_slots <= 0:
+                    logger.debug(
+                        f"📊 Арбитраж (красный режим): лимит позиций достигнут ({max_positions})"
+                    )
+                    return
+
+                # Split remaining allocation across remaining slots
+                per_position = remaining_allocation / max(1, remaining_slots)
+                min_size = float(ARBITRAGE_RED_MIN_POSITION_SIZE_USD)
+                position_size_usd = max(min_size, per_position)
+
+                logger.info(
+                    "💹 Авто-арбитраж (красный режим): "
+                    f"лимит={max_positions}, аллокация={float(ARBITRAGE_RED_TOTAL_ALLOCATION_PCT)*100:.0f}%, "
+                    f"стейблы≈${stable_total:.2f}, в_арбитраже≈${current_arb_value:.2f}, "
+                    f"остаток≈${remaining_allocation:.2f}, размер≈${position_size_usd:.2f}"
+                )
+
             # Проверяем количество открытых арбитражных позиций
             open_positions = arbitrage_service.repo.get_open_positions()
-            if len(open_positions) >= ARBITRAGE_MAX_POSITIONS:
-                logger.debug(f"📊 Арбитраж: достигнут лимит позиций ({len(open_positions)}/{ARBITRAGE_MAX_POSITIONS})")
+            if len(open_positions) >= max_positions:
+                logger.debug(f"📊 Арбитраж: достигнут лимит позиций ({len(open_positions)}/{max_positions})")
                 return
             
             # Сканируем возможности
@@ -659,13 +1041,13 @@ class BotController:
                 if opp['pair'] in open_pairs:
                     continue  # Уже есть позиция
                 
-                if len(open_positions) >= ARBITRAGE_MAX_POSITIONS:
+                if len(open_positions) >= max_positions:
                     break
                 
                 # Открываем арбитраж
                 success, message = await arbitrage_service.open_arbitrage(
                     opp['pair'], 
-                    ARBITRAGE_POSITION_SIZE_USD
+                    position_size_usd
                 )
                 
                 if success:

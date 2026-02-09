@@ -146,6 +146,34 @@ class DatabaseConnection:
                     value TEXT
                 )
             """)
+
+            # 7. Slippage Events
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS slippage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair TEXT NOT NULL,
+                    action TEXT,
+                    slippage REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+            # 8. Daily PnL (UTC)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_pnl (
+                    date_utc TEXT PRIMARY KEY,
+                    gross_pnl REAL DEFAULT 0,
+                    net_pnl REAL DEFAULT 0,
+                    commission_paid REAL DEFAULT 0,
+                    slippage REAL DEFAULT 0,
+                    trades_count INTEGER DEFAULT 0,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            self._apply_migrations(conn, cursor)
             
             conn.commit()
             logger.info("💾 Таблицы базы данных проверены/созданы")
@@ -155,6 +183,32 @@ class DatabaseConnection:
             raise
         finally:
             conn.close()
+
+    def _apply_migrations(self, conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> None:
+        """Авто-миграции схемы БД (добавление недостающих колонок)."""
+
+        def _get_columns(table: str) -> set[str]:
+            cursor.execute(f"PRAGMA table_info({table})")
+            return {row[1] for row in cursor.fetchall()}
+
+        def _add_column(table: str, column: str, ddl: str) -> None:
+            cols = _get_columns(table)
+            if column in cols:
+                return
+            logger.warning(f"🛠️ DB migration: add column {table}.{column}")
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+        # orders
+        _add_column("orders", "slippage", "slippage REAL DEFAULT 0")
+
+        # positions
+        _add_column("positions", "commission_paid", "commission_paid REAL DEFAULT 0")
+        _add_column("positions", "slippage", "slippage REAL DEFAULT 0")
+        _add_column("positions", "gross_pnl", "gross_pnl REAL DEFAULT 0")
+        _add_column("positions", "net_pnl", "net_pnl REAL DEFAULT 0")
+        _add_column("positions", "pyramiding_count", "pyramiding_count INTEGER DEFAULT 0")
+
+        conn.commit()
     
     def get_connection(self):
         """Получить подключение для текущего потока"""

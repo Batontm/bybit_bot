@@ -4,8 +4,11 @@
 from typing import Dict, Optional, List
 from pybit.unified_trading import HTTP
 from config.settings import logger
-from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_ACCOUNT_TYPE
+from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_ACCOUNT_TYPE, get_pybit_kwargs
 from ..error_tracker import error_tracker
+
+
+DUST_THRESHOLD_USD = 5.0  # Балансы дешевле $5 считаются пылью
 
 
 class BalanceService:
@@ -13,7 +16,7 @@ class BalanceService:
     
     def __init__(self):
         self.client = HTTP(
-            testnet=BYBIT_TESTNET,
+            **get_pybit_kwargs(),
             api_key=BYBIT_API_KEY,
             api_secret=BYBIT_API_SECRET,
             recv_window=60000

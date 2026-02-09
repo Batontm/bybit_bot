@@ -6,7 +6,7 @@ from datetime import datetime
 import math
 from pybit.unified_trading import HTTP
 from config.settings import logger, TIMEZONE
-from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET
+from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, get_pybit_kwargs
 from config.trading_config import (
     ARBITRAGE_MIN_VOLUME_USDT,
     ARBITRAGE_SCAN_LIMIT
@@ -23,15 +23,21 @@ class ArbitrageService:
         'USDC', 'DAI', 'FDUSD', 'USDE', 'EUR', 'USD', 'BUSD', 'USDD', 'TUSD', 'PYUSD',
         '3L', '3S', '2L', '2S', '5L', '5S'
     ]
+
+    # Монеты с высоким collateral ratio (>= 0.9) на Bybit Unified Account.
+    # Только эти монеты безопасны для арбитража (спот покрывает маржу шорта).
+    SAFE_COLLATERAL_COINS = {
+        'BTCUSDT', 'ETHUSDT',
+    }
     
     # Минимальный funding rate для открытия (0.01% = 0.0001)
     MIN_FUNDING_RATE = 0.0001
     
     def __init__(self):
         self.client = HTTP(
+            **get_pybit_kwargs(),
             api_key=BYBIT_API_KEY,
             api_secret=BYBIT_API_SECRET,
-            testnet=BYBIT_TESTNET,
             recv_window=20000
         )
         self.repo = ArbitrageRepository()
@@ -208,6 +214,10 @@ class ArbitrageService:
             (success, message)
         """
         try:
+            # Проверка collateral whitelist — только BTC/ETH безопасны для арбитража
+            if pair not in self.SAFE_COLLATERAL_COINS:
+                return False, f"⚠️ {pair} не в whitelist арбитража (риск ликвидации, collateral ratio < 0.9)"
+
             # Проверяем, нет ли уже открытой позиции по этой паре
             existing = self.repo.get_position_by_pair(pair)
             if existing:

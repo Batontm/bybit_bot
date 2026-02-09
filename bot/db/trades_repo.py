@@ -1,7 +1,7 @@
 """
 Repository для работы со сделками, ордерами и позициями
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from config.settings import logger, TIMEZONE
 from .connection import get_db, get_transaction
@@ -73,6 +73,53 @@ class TradesRepository:
             if updated:
                 logger.info(f"📝 Ордер обновлён: {order_id} → {status}")
             return updated
+
+    @staticmethod
+    def update_position_pnl_breakdown(
+        position_id: int,
+        *,
+        commission_paid: float,
+        slippage: float,
+        gross_pnl: float,
+        net_pnl: float,
+    ) -> bool:
+        """Сохранить детализацию PnL для позиции. Также синхронизирует realized_pnl с net_pnl."""
+        with get_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE positions
+                SET commission_paid = ?,
+                    slippage = ?,
+                    gross_pnl = ?,
+                    net_pnl = ?,
+                    realized_pnl = ?
+                WHERE id = ?
+                """,
+                (commission_paid, slippage, gross_pnl, net_pnl, net_pnl, position_id),
+            )
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def update_position_open_costs(
+        position_id: int,
+        *,
+        commission_paid: float,
+        slippage: float,
+    ) -> bool:
+        """Обновить накопленные издержки по открытой позиции (без изменения PnL полей)."""
+        with get_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE positions
+                SET commission_paid = ?,
+                    slippage = ?
+                WHERE id = ?
+                """,
+                (commission_paid, slippage, position_id),
+            )
+            return cursor.rowcount > 0
     
     @staticmethod
     def get_order_by_id(order_id: str) -> Optional[Dict]:
@@ -128,6 +175,18 @@ class TradesRepository:
                 SET price = ?, updated_at = ?
                 WHERE order_id = ?
             """, (new_price, datetime.now(TIMEZONE).isoformat(), order_id))
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def update_order_slippage(order_id: str, slippage: float) -> bool:
+        """Сохранить slippage по ордеру (в процентах доли, например 0.002 = 0.2%)."""
+        with get_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE orders
+                SET slippage = ?, updated_at = ?
+                WHERE order_id = ?
+            """, (slippage, datetime.now(TIMEZONE).isoformat(), order_id))
             return cursor.rowcount > 0
 
     @staticmethod
@@ -250,6 +309,37 @@ class TradesRepository:
             cursor.execute("SELECT * FROM positions WHERE id = ?", (position_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    def get_closed_positions_between_utc(start_utc: datetime, end_utc: datetime) -> List[Dict]:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM positions
+                WHERE status = 'CLOSED' AND closed_at IS NOT NULL
+                ORDER BY closed_at ASC
+                """
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+
+        result: List[Dict] = []
+        for pos in rows:
+            closed_at_raw = pos.get('closed_at')
+            if not closed_at_raw:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(closed_at_raw))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TIMEZONE)
+                dt_utc = dt.astimezone(timezone.utc)
+            except Exception:
+                continue
+
+            if start_utc <= dt_utc < end_utc:
+                result.append(pos)
+
+        return result
     
     @staticmethod
     def set_position_tpsl(position_id: int, tp_price: float = None, 

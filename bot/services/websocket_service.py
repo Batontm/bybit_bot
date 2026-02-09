@@ -5,7 +5,7 @@ import time
 from typing import Dict, List, Optional
 from pybit.unified_trading import WebSocket, HTTP
 from config.settings import logger
-from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET
+from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, get_pybit_kwargs, get_pybit_ws_public_kwargs
 
 class PriceStreamService:
     """Сервис получения цен в реальном времени через WebSocket"""
@@ -24,7 +24,7 @@ class PriceStreamService:
         if self._ws is None and not self._ws_connected:
             try:
                 self._ws = WebSocket(
-                    testnet=BYBIT_TESTNET,
+                    **get_pybit_ws_public_kwargs(),
                     channel_type="spot",
                     api_key=BYBIT_API_KEY,
                     api_secret=BYBIT_API_SECRET
@@ -41,7 +41,7 @@ class PriceStreamService:
         """Ленивая инициализация REST клиента"""
         if self._rest_client is None:
             self._rest_client = HTTP(
-                testnet=BYBIT_TESTNET,
+                **get_pybit_kwargs(),
                 api_key=BYBIT_API_KEY,
                 api_secret=BYBIT_API_SECRET
             )

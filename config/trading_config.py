@@ -38,7 +38,7 @@ TREND_EMA_SLOW = 50               # Медленная EMA
 # ============= PYRAMIDING (пирамидинг входа) =============
 PYRAMIDING_ENABLED = True           # Включить пирамидинг
 INITIAL_POSITION_PERCENT = 0.65     # Первоначальный вход = 65% от расчётного размера
-PYRAMIDING_TRIGGER = -0.005         # Докупка при просадке -0.5% от входа
+PYRAMIDING_TRIGGER = 0.01         # Докупка при просадке -0.5% от входа
 PYRAMIDING_ADD_PERCENT = 0.35       # Размер докупки = 35% (всего 100%)
 
 # ============= SMART DCA (усреднение) =============
@@ -54,13 +54,13 @@ BREAKEVEN_TRIGGER_PERCENT = 0.01  # При +1% переносим SL в точк
 BREAKEVEN_BUFFER = 0.001          # Буфер +0.1% над ценой входа
 
 # ============= TRAILING STOP (улучшенный) =============
-TRAILING_ACTIVATION = 0.03       # Активация: +3% прибыли (было +1%)
+TRAILING_ACTIVATION = 0.015       # Активация: +3% прибыли (было +1%)
 TRAILING_STEP = 0.015            # Держать SL на 1.5% от текущей цены (было 1%)
 
 # ============= TIME EXIT (выход по времени) =============
 TIME_EXIT_ENABLED = True          # Включить автозакрытие по времени
-MAX_POSITION_HOURS = 8            # Закрывать позиции старше 8 часов (было 4)
-STALE_MOVE_THRESHOLD = 0.005      # Позиция "мёртвая" если движение < 0.5%
+MAX_POSITION_HOURS = 16            # Закрывать позиции старше 8 часов (было 4)
+STALE_MOVE_THRESHOLD = 0.0      # Позиция "мёртвая" если движение < 0.5%
 
 # ============= ПАРАМЕТРЫ АНАЛИЗА =============
 
@@ -132,5 +132,14 @@ ARBITRAGE_POSITION_SIZE_USD = 100  # Размер позиции в USDT
 ARBITRAGE_FUNDING_UPDATE_HOURS = 8  # Обновление funding каждые 8 часов
 ARBITRAGE_MIN_VOLUME_USDT = 10_000_000  # Мин. объем торгов за 24ч для пары
 ARBITRAGE_SCAN_LIMIT = 50           # Сколько топ-ликвидных пар сканировать
+
+# Усиление авто-арбитража в «красном» режиме (когда новые сделки запрещены Светофором)
+# Идея: деньги не простаивают, а работают в market-neutral funding arbitrage.
+ARBITRAGE_RED_MODE_ENABLED = True
+ARBITRAGE_RED_MAX_POSITIONS = 8
+# Максимальная доля стейбл-депозита (USDT+USDC), которая может быть задействована в арбитраже
+ARBITRAGE_RED_TOTAL_ALLOCATION_PCT = 0.30
+# Минимальный размер одной арбитражной позиции (защита от микросделок)
+ARBITRAGE_RED_MIN_POSITION_SIZE_USD = 50
 
 
