@@ -18,3 +18,6 @@ venv/
 
 *.zip
 deploy.zip
+
+# Cursor automation SSH keys (do not commit)
+.cursor_ssh/

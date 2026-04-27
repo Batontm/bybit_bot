@@ -159,21 +159,25 @@ class TradingBot:
         checks['bybit_ws'] = True
         logger.info("   ✅ WebSocket эндпоинты доступны")
         
-        # 5. Perplexity API
-        logger.info("🤖 Проверка Perplexity API...")
-        if perplexity_client.is_available:
-            perplexity_ok = perplexity_client.test_connection()
-            checks['perplexity'] = perplexity_ok
-            
-            if perplexity_ok:
-                logger.info("   ✅ Perplexity API доступен")
-            else:
-                logger.warning("   ⚠️ Perplexity API недоступен, режим RISK_ONLY")
-                checks['mode'] = 'RISK_ONLY'
+        # 5. LLM Provider (Groq / Perplexity / Ollama — любой)
+        logger.info("🤖 Проверка LLM провайдеров...")
+        from bot.llm_router import llm_router
+        status = llm_router.get_status()
+        logger.info(f"   Режим: {status['mode']}")
+        logger.info(f"   Perplexity: {'✅' if status['perplexity'] else '❌'}")
+        logger.info(f"   Groq:       {'✅' if status['groq'] else '❌'}")
+        logger.info(f"   Ollama:     {'✅' if status['ollama'] else '❌'}")
+
+        if llm_router.test_active_provider():
+            logger.info("   ✅ Хотя бы один LLM провайдер доступен")
+            checks['llm'] = True
         else:
-            logger.warning("   ⚠️ Perplexity API key не установлен, режим RISK_ONLY")
-            checks['perplexity'] = False
+            logger.warning("   ⚠️ Ни один LLM провайдер недоступен, режим RISK_ONLY")
+            checks['llm'] = False
             checks['mode'] = 'RISK_ONLY'
+
+        # legacy ключ для обратной совместимости
+        checks['perplexity'] = status['perplexity']
         
         # 6. База данных
         logger.info("💾 Проверка базы данных...")

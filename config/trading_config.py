@@ -83,8 +83,8 @@ MIN_ANALYSIS_INTERVAL_PER_PAIR = 300  # секунд (5 минут)
 ESTIMATED_COST_PER_REQUEST = 0.02     # $
 
 # ============= LLM PROVIDER MODE =============
-# Режимы: PERPLEXITY_ONLY, LOCAL_ONLY, HYBRID, PREFER_LOCAL
-LLM_PROVIDER_MODE = "PERPLEXITY_ONLY"  # Ollama отключён (недостаточно RAM)
+# Режимы: PERPLEXITY_ONLY, GROQ_ONLY, LOCAL_ONLY, HYBRID, PREFER_LOCAL, PREFER_GROQ
+LLM_PROVIDER_MODE = "DEEPSEEK_ONLY"  # DeepSeek: дешёво, качественно, работает из РФ
 
 # ============= ТОРГОВЫЕ ПАРЫ ПО УМОЛЧАНИЮ =============
 

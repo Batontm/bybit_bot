@@ -37,6 +37,7 @@ from .services.prefilter_service import prefilter_service
 from .services.arbitrage_service import arbitrage_service
 from .services.market_regime_service import market_regime_service
 from .perplexity_client import perplexity_client
+from .llm_router import llm_router
 
 
 BOT_VERSION = "v2.1.0"
@@ -164,9 +165,9 @@ class BotController:
         """Запустить контроллер и планировщик"""
         logger.info("🚀 Запуск контроллера...")
         
-        # Проверка доступности Perplexity
-        if not perplexity_client.is_available:
-            logger.warning("⚠️ Perplexity недоступен, переход в режим RISK_ONLY")
+        # Проверка доступности LLM (любой из провайдеров: Groq / Perplexity / Ollama)
+        if not llm_router.has_any_provider():
+            logger.warning("⚠️ Ни один LLM-провайдер не доступен, режим RISK_ONLY")
             self.mode = "RISK_ONLY"
         
         # Получаем настройки сканера из БД
@@ -748,15 +749,11 @@ class BotController:
             self.mode = "ACTIVE"
             logger.info("▶️ Бот возобновлён после сброса дневных лимитов")
         
-        # Проверяем доступность Perplexity
+        # Проверяем доступность LLM-провайдеров
         if self.mode == "RISK_ONLY":
-            if perplexity_client.is_available:
-                can_use, reason = perplexity_client.check_limits()
-                if can_use:
-                    self.mode = "ACTIVE"
-                    logger.info("✅ Perplexity доступен, переход в режим ACTIVE")
-                    self.mode = "ACTIVE"
-                    logger.info("✅ Perplexity доступен, переход в режим ACTIVE")
+            if llm_router.has_any_provider():
+                self.mode = "ACTIVE"
+                logger.info("✅ LLM-провайдер доступен, переход в режим ACTIVE")
     
     async def _update_market_pairs(self):
         """Обновление списка пар через сканер (с сохранением на 24ч)"""
