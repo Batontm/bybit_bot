@@ -101,6 +101,9 @@ def parse_analysis(content: str) -> Dict:
 
     for line in lines:
         line_str = line.strip()
+        # Снимаем markdown-обёртки: "**SCORE:** 45" → "SCORE: 45"
+        line_str = line_str.lstrip('*_#- ').rstrip('*_ ')
+        line_str = line_str.replace('**', '').replace('__', '')
         line_upper = line_str.upper()
 
         if line_upper.startswith('SCORE:'):
