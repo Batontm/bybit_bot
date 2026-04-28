@@ -6,17 +6,10 @@ import time
 from typing import Dict, List
 from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 from config.settings import logger, TIMEZONE
 from config.trading_config import (
-    SIGNAL_CHECK_INTERVAL,
-    BALANCE_UPDATE_INTERVAL,
-    TPSL_CHECK_INTERVAL,
     DEFAULT_TRADING_PAIRS,
     MAX_CONSECUTIVE_LOSSES,
-    ARBITRAGE_ENABLED,
-    ARBITRAGE_CHECK_INTERVAL,
     ARBITRAGE_MIN_FUNDING_RATE,
     ARBITRAGE_MAX_POSITIONS,
     ARBITRAGE_POSITION_SIZE_USD,
@@ -38,6 +31,7 @@ from .services.arbitrage_service import arbitrage_service
 from .services.market_regime_service import market_regime_service
 from .services.notification_dispatcher import NotificationDispatcher
 from .services.slippage_guard import SlippageGuard
+from .services.job_scheduler import setup_jobs
 from .llm_router import llm_router
 
 
@@ -238,160 +232,8 @@ class BotController:
         return messages
 
     def _setup_scheduler(self):
-        """Настроить задачи планировщика"""
-        
-        # 1. Проверка сигналов (каждые N секунд)
-        self.scheduler.add_job(
-            self._check_signals,
-            trigger=IntervalTrigger(seconds=SIGNAL_CHECK_INTERVAL),
-            id='check_signals',
-            name='Проверка торговых сигналов',
-            max_instances=1
-        )
-        
-        # 2. Обновление балансов (каждую минуту)
-        self.scheduler.add_job(
-            self._update_balances,
-            trigger=IntervalTrigger(seconds=BALANCE_UPDATE_INTERVAL),
-            id='update_balances',
-            name='Обновление балансов',
-            max_instances=1
-        )
-        
-        # 3. Проверка TP/SL (каждые 10 секунд)
-        self.scheduler.add_job(
-            self._check_tpsl,
-            trigger=IntervalTrigger(seconds=TPSL_CHECK_INTERVAL),
-            id='check_tpsl',
-            name='Проверка TP/SL',
-            max_instances=1
-        )
-        
-        # 4. Обновление цен позиций (каждые 30 секунд)
-        self.scheduler.add_job(
-            self._update_positions_prices,
-            trigger=IntervalTrigger(seconds=30),
-            id='update_prices',
-            name='Обновление цен позиций',
-            max_instances=1
-        )
-
-        self.scheduler.add_job(
-            self._sync_orders_and_trades,
-            trigger=IntervalTrigger(seconds=60),
-            id='sync_orders',
-            name='Sync Orders/Trades',
-            max_instances=1
-        )
-
-        # Reconciliation orphan orders (каждые 5 часов)
-        self.scheduler.add_job(
-            self._reconcile_orphan_orders,
-            trigger=IntervalTrigger(hours=5),
-            id='reconcile_orphans',
-            name='Reconcile Orphan Orders',
-            max_instances=1
-        )
-        
-        # 5. Trailing Stop (каждые 30 секунд)
-        self.scheduler.add_job(
-            self._update_trailing_stops,
-            trigger=IntervalTrigger(seconds=30),
-            id='trailing_stop',
-            name='Trailing Stop',
-            max_instances=1
-        )
-        
-        # 6. Breakeven (каждые 30 секунд)
-        self.scheduler.add_job(
-            self._check_breakeven,
-            trigger=IntervalTrigger(seconds=30),
-            id='check_breakeven',
-            name='Breakeven Check',
-            max_instances=1
-        )
-        
-        # 7. Time Exit (каждые 5 минут)
-        self.scheduler.add_job(
-            self._check_time_exit,
-            trigger=IntervalTrigger(minutes=5),
-            id='check_time_exit',
-            name='Time Exit Check',
-            max_instances=1
-        )
-        
-        # 8. Smart DCA (каждые 2 минуты)
-        self.scheduler.add_job(
-            self._check_dca,
-            trigger=IntervalTrigger(minutes=2),
-            id='check_dca',
-            name='Smart DCA Check',
-            max_instances=1
-        )
-        
-        # 9. Сброс дневных лимитов (в полночь по Europe/Kaliningrad)
-        self.scheduler.add_job(
-            self._reset_daily_limits,
-            trigger=CronTrigger(hour=0, minute=0, timezone=TIMEZONE),
-            id='reset_daily',
-            name='Сброс дневных лимитов',
-            max_instances=1
-        )
-
-        self.scheduler.add_job(
-            self._update_daily_pnl_utc,
-            trigger=CronTrigger(hour=0, minute=0, timezone='UTC'),
-            id='daily_pnl_utc',
-            name='Daily PnL UTC',
-            max_instances=1
-        )
-        
-        # 6. Обновление динамических пар (каждый час)
-        self.scheduler.add_job(
-            self._update_market_pairs,
-            trigger=IntervalTrigger(hours=1),
-            id='update_pairs',
-            name='Обновление списка пар',
-            max_instances=1
-        )
-        
-        # 10. Авто-создание SL для позиций без защиты (каждые 2 минуты)
-        self.scheduler.add_job(
-            self._auto_create_missing_sl,
-            trigger=IntervalTrigger(minutes=2),
-            id='auto_sl',
-            name='Auto SL Creation',
-            max_instances=1
-        )
-
-        self.scheduler.add_job(
-            self._emergency_sl_watchdog,
-            trigger=IntervalTrigger(seconds=15),
-            id='emergency_sl',
-            name='Emergency SL Watchdog',
-            max_instances=1
-        )
-        
-        # 11. Авто-арбитраж: сканирование и открытие (каждый час)
-        if ARBITRAGE_ENABLED:
-            self.scheduler.add_job(
-                self._auto_arbitrage,
-                trigger=IntervalTrigger(seconds=ARBITRAGE_CHECK_INTERVAL),
-                id='auto_arbitrage',
-                name='Auto Arbitrage',
-                max_instances=1
-            )
-            
-            # 12. Обновление funding каждые 8 часов (0:00, 8:00, 16:00 UTC)
-            self.scheduler.add_job(
-                self._update_arbitrage_funding,
-                trigger=CronTrigger(hour='0,8,16', minute=5, timezone='UTC'),
-                id='update_arbitrage_funding',
-                name='Update Arbitrage Funding',
-                max_instances=1
-            )
-        
-        logger.info("📅 Планировщик настроен")
+        """Настроить задачи планировщика (декларативно — см. bot/services/job_scheduler.py)."""
+        setup_jobs(self.scheduler, self)
 
     async def _update_daily_pnl_utc(self):
         try:
