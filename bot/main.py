@@ -14,7 +14,6 @@ from config.api_config import validate_config, get_pybit_kwargs
 from config.trading_config import DEFAULT_TRADING_PAIRS
 from bot.controller import controller
 from bot.telegram_aiogram.bot import create_telegram_bot
-from bot.perplexity_client import perplexity_client
 from bot.services.balance_service import balance_service
 from bot.error_tracker import error_tracker
 from pybit.unified_trading import HTTP

@@ -36,7 +36,6 @@ from .services.websocket_service import websocket_service
 from .services.prefilter_service import prefilter_service
 from .services.arbitrage_service import arbitrage_service
 from .services.market_regime_service import market_regime_service
-from .perplexity_client import perplexity_client
 from .llm_router import llm_router
 
 
