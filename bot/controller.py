@@ -36,6 +36,8 @@ from .services.websocket_service import websocket_service
 from .services.prefilter_service import prefilter_service
 from .services.arbitrage_service import arbitrage_service
 from .services.market_regime_service import market_regime_service
+from .services.notification_dispatcher import NotificationDispatcher
+from .services.slippage_guard import SlippageGuard
 from .llm_router import llm_router
 
 
@@ -50,115 +52,75 @@ class BotController:
         self.mode = "ACTIVE"  # ACTIVE, RISK_ONLY, PAUSED
         self.auto_trading_enabled = True
         self.scanner_enabled = False  # По умолчанию выключен
-        self.notifications_enabled = True
-        self.alerts_enabled = True
         self.started_at: datetime = datetime.now(TIMEZONE)
-        
-        # Пары
+
+        # Подсистемы
+        self.notifier = NotificationDispatcher()
+        self.slippage_guard = SlippageGuard(notifier=self.notifier.send)
+
+        # Сервисы
         self.trading_service = trading_service
         self.position_service = position_service
         self.analysis_service = analysis_service
         self.balance_service = balance_service
         self.scanner_service = scanner_service
-        
+
         self.fixed_pairs = list(DEFAULT_TRADING_PAIRS)
         self.dynamic_pairs = []
         self.dynamic_pairs_data = {}  # {symbol: timestamp} для 24ч памяти
 
-        
         self.is_running = False
-        self.notification_callback = None
+
+    # -------- backward-compat: флаги уведомлений делегируем в dispatcher --------
+
+    @property
+    def notifications_enabled(self) -> bool:
+        return self.notifier.notifications_enabled
+
+    @notifications_enabled.setter
+    def notifications_enabled(self, value: bool) -> None:
+        self.notifier.notifications_enabled = bool(value)
+
+    @property
+    def alerts_enabled(self) -> bool:
+        return self.notifier.alerts_enabled
+
+    @alerts_enabled.setter
+    def alerts_enabled(self, value: bool) -> None:
+        self.notifier.alerts_enabled = bool(value)
+
+    @property
+    def notification_callback(self):
+        return self.notifier._callback
+
+    @notification_callback.setter
+    def notification_callback(self, value) -> None:
+        self.notifier._callback = value
     
     def set_notifier(self, callback):
         """Установить callback для уведомлений"""
         self.notification_callback = callback
 
-    async def _send_notification(self, message: str):
-        """Отправить уведомление если callback установлен"""
-        try:
-            is_alert = self._is_alert_message(message)
-            if is_alert and not self.alerts_enabled:
-                return
-            if (not is_alert) and (not self.notifications_enabled):
-                return
-        except Exception:
-            pass
+    # -------- thin delegates (sane backward-compat) --------
 
-        if self.notification_callback:
-            try:
-                await self.notification_callback(message)
-            except Exception as e:
-                logger.error(f"❌ Ошибка отправки уведомления: {e}")
+    async def _send_notification(self, message: str) -> None:
+        await self.notifier.send(message)
 
     @staticmethod
     def _is_alert_message(message: str) -> bool:
-        if not message:
-            return False
-
-        # Простая классификация: критичные сообщения/алерты
-        alert_prefixes = (
-            "⛔️",
-            "❌",
-            "⚠️",
-            "💸",
-        )
-        return message.startswith(alert_prefixes)
+        return NotificationDispatcher.is_alert(message)
 
     def _ban_key(self, pair: str) -> str:
-        return f"ban_pair_{pair}"
+        return SlippageGuard._ban_key(pair)
 
     def _is_pair_banned(self, pair: str) -> bool:
-        try:
-            with db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT value FROM settings WHERE key = ?", (self._ban_key(pair),))
-                row = cursor.fetchone()
-                if not row or not row[0]:
-                    return False
-                ban_until = datetime.fromisoformat(row[0])
-                if ban_until.tzinfo is None:
-                    ban_until = ban_until.replace(tzinfo=TIMEZONE)
-                return datetime.now(TIMEZONE) < ban_until
-        except Exception:
-            return False
+        return self.slippage_guard.is_pair_banned(pair)
 
     def _record_slippage_event(self, pair: str, action: str, slippage: float) -> int:
-        """Записать событие превышения slippage. Возвращает число превышений за 24ч."""
-        try:
-            now = datetime.now(TIMEZONE)
-            cutoff = (now - timedelta(hours=24)).isoformat()
-            with db.transaction() as conn:
-                conn.execute(
-                    "INSERT INTO slippage_events (pair, action, slippage, created_at) VALUES (?, ?, ?, ?)",
-                    (pair, action, float(slippage), now.isoformat()),
-                )
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT COUNT(*) FROM slippage_events WHERE pair = ? AND created_at >= ?",
-                    (pair, cutoff),
-                )
-                row = cursor.fetchone()
-                return int(row[0] if row else 0)
-        except Exception:
-            return 0
+        return self.slippage_guard.record_event(pair, action, slippage)
 
     async def _ban_pair_for_slippage(self, pair: str, exceed_count_24h: int) -> None:
-        """Забанить пару на 24ч и уведомить."""
-        if self._is_pair_banned(pair):
-            return
-        ban_until = datetime.now(TIMEZONE) + timedelta(hours=24)
-        try:
-            with db.transaction() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                    (self._ban_key(pair), ban_until.isoformat()),
-                )
-        except Exception:
-            return
-
-        await self._send_notification(
-            f"⛔️ {pair} заблокирована на 24ч из-за slippage (превышений за 24ч: {exceed_count_24h})\nДо: {ban_until.isoformat()}"
-        )
+        await self.slippage_guard._ban_pair(pair, exceed_count_24h)
     
     async def start(self):
         """Запустить контроллер и планировщик"""
