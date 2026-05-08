@@ -582,11 +582,6 @@ class PositionService:
 
     async def emergency_sl_watchdog(self) -> List[str]:
         messages = []
-        try:
-            await self.update_positions_prices()
-        except Exception:
-            pass
-
         open_positions = self.trades_repo.get_open_positions()
         for pos in open_positions:
             try:

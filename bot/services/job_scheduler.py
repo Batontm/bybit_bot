@@ -45,8 +45,6 @@ def _build_jobs() -> List[JobSpec]:
          '_update_balances',  IntervalTrigger(seconds=BALANCE_UPDATE_INTERVAL)),
         ('check_tpsl',        'Проверка TP/SL',
          '_check_tpsl',       IntervalTrigger(seconds=TPSL_CHECK_INTERVAL)),
-        ('update_prices',     'Обновление цен позиций',
-         '_update_positions_prices', IntervalTrigger(seconds=30)),
         ('sync_orders',       'Sync Orders/Trades',
          '_sync_orders_and_trades',  IntervalTrigger(seconds=60)),
         ('reconcile_orphans', 'Reconcile Orphan Orders',

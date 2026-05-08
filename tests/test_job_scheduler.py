@@ -42,3 +42,10 @@ def test_job_specs_have_required_fields():
         assert isinstance(name, str) and name
         assert isinstance(method_name, str) and method_name.startswith('_')
         assert trigger is not None
+
+
+def test_no_duplicate_position_price_job():
+    """Регрессия #13: не должно быть отдельной дублирующей update_prices-задачи."""
+    job_ids = [job_id for job_id, _name, _method_name, _trigger in _build_jobs()]
+    assert 'check_tpsl' in job_ids
+    assert 'update_prices' not in job_ids

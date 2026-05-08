@@ -97,7 +97,7 @@ class AnalysisService:
             volume_24h = float(data['volume24h'])
             
             # Определяем тренд по изменению цены
-            if change_24h > 2:
+            if change_24h > 8:
                 trend = "восходящий"
             elif change_24h < -2:
                 trend = "нисходящий"
