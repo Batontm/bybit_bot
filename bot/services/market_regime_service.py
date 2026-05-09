@@ -113,7 +113,7 @@ class MarketRegimeService:
             # ATR spike check — блокировка при панике на рынке
             atr_blocked = atr_ratio is not None and atr_ratio > self.ATR_SPIKE_MULTIPLIER
 
-            ok = (price > ema200) and (rsi14 >= 50) and (not atr_blocked)
+            ok = (price > ema200) and (rsi14 >= 40) and (not atr_blocked)
             if ok:
                 label = "ЗЕЛЕНЫЙ"
                 atr_info = f", ATR_ratio={atr_ratio:.2f}" if atr_ratio else ""
@@ -125,7 +125,7 @@ class MarketRegimeService:
                 parts = []
                 if not (price > ema200):
                     parts.append(f"close={price:.2f} <= EMA200={ema200:.2f}")
-                if not (rsi14 >= 50):
+                if not (rsi14 >= 40):
                     parts.append(f"RSI14={rsi14:.2f} < 50")
                 if atr_blocked:
                     parts.append(f"ATR spike={atr_ratio:.2f}x > {self.ATR_SPIKE_MULTIPLIER}x")
