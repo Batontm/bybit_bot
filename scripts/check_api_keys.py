@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -32,6 +33,28 @@ ENVS = {
     "mainnet": "https://api.bybit.com",
 }
 RECV_WINDOW = "10000"
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """
+    Python с python.org на macOS ставится без корневых сертификатов
+    (CERTIFICATE_VERIFY_FAILED). Если установлен certifi — берём его набор,
+    проверка сертификата при этом остаётся включённой.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+SSL_CTX = _ssl_context()
+SSL_HINT = (
+    "\n💡 Python на Mac не видит корневые сертификаты. Исправить один раз:\n"
+    "   open \"/Applications/Python 3.$(python3 -c 'import sys;print(sys.version_info[1])')/Install Certificates.command\"\n"
+    "   или: python3 -m pip install --upgrade certifi\n"
+    "   и запустить проверку снова."
+)
 
 
 def load_env(path: Path) -> dict:
@@ -61,7 +84,7 @@ def signed_get(base: str, path: str, params: dict, key: str, secret: str) -> dic
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:
@@ -86,6 +109,7 @@ def main() -> int:
 
     working = None
     offline = 0
+    ssl_failed = False
     for name, base in ENVS.items():
         r = signed_get(base, "/v5/user/query-api", {}, key, secret)
         code, msg = r.get("retCode"), r.get("retMsg")
@@ -100,12 +124,16 @@ def main() -> int:
             print(f"⛔ {name:8} {base} — IP этого компьютера не в белом списке ключа")
         elif code == -1:
             offline += 1
+            ssl_failed = ssl_failed or 'CERTIFICATE_VERIFY_FAILED' in str(msg)
             print(f"⚠️  {name:8} {base} — {msg}")
         else:
             print(f"❌ {name:8} {base} — retCode={code}: {msg}")
 
     if not working:
-        if offline == len(ENVS):
+        if ssl_failed:
+            print("\n⚠️ Соединение не установлено из-за сертификатов Python — ключи не проверены.")
+            print(SSL_HINT)
+        elif offline == len(ENVS):
             print("\n⚠️ Bybit недоступен с этого компьютера (сеть/VPN/блокировка) — ключи не проверены.")
         else:
             print("\n❌ Ключи не приняты ни одной средой Bybit.")
