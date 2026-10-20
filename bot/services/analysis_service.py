@@ -27,7 +27,8 @@ class AnalysisService:
         self.bybit_client = HTTP(**get_pybit_kwargs())
     
     async def analyze_pair(self, pair: str, timeframe: str = "1h", 
-                          use_cache: bool = True) -> Optional[Dict]:
+                          use_cache: bool = True,
+                          extra_context: Optional[Dict] = None) -> Optional[Dict]:
         """
         Провести анализ торговой пары
         
@@ -35,6 +36,7 @@ class AnalysisService:
             pair: Торговая пара
             timeframe: Таймфрейм для анализа
             use_cache: Использовать кэш если доступен
+            extra_context: Доп. данные для промпта (например, результаты воронки входа)
         
         Returns:
             Dict с анализом или None
@@ -48,7 +50,7 @@ class AnalysisService:
             
             if cached:
                 logger.info(f"📦 Используем кэшированный анализ: {pair}")
-                return {
+                result = {
                     'pair': cached['pair'],
                     'timeframe': cached['timeframe'],
                     'score': cached['score'],
@@ -57,6 +59,15 @@ class AnalysisService:
                     'cached': True,
                     'timestamp': cached['created_at']
                 }
+                # Свежие рыночные данные обязательны: без rsi/change_24h/bb_upper
+                # жёсткие VETO в should_enter_trade молча пропускались.
+                fresh = self.get_market_data(pair)
+                if not fresh:
+                    logger.warning(f"⚠️ {pair}: нет свежих рыночных данных для кэшированного анализа")
+                    return None
+                for k, v in fresh.items():
+                    result.setdefault(k, v)
+                return result
         
         # Получаем рыночные данные
         market_data = self.get_market_data(pair)
@@ -64,6 +75,9 @@ class AnalysisService:
         if not market_data:
             logger.error(f"❌ Не удалось получить данные для {pair}")
             return None
+
+        if extra_context:
+            market_data.update(extra_context)
         
         # Запрашиваем анализ у LLM Router (Perplexity / Ollama)
         analysis = await llm_router.analyze_pair(pair, timeframe, market_data)
@@ -114,7 +128,8 @@ class AnalysisService:
             }
             
             # Добавляем технические индикаторы
-            klines = self.get_klines(pair, interval="60", limit=60)
+            klines = self.get_klines(pair, interval="60", limit=61)
+            klines = klines[:-1]  # без текущей незакрытой свечи
             if klines and len(klines) >= 50:
                 closes = [float(k['close']) for k in klines]
                 tech_analysis = technical_indicators.analyze(closes)

@@ -341,6 +341,72 @@ class TechnicalIndicators:
         
         return result
 
+    # ----------------------------------------------------------------- series
+
+    @staticmethod
+    def ema_series(closes: List[float], period: int) -> List[float]:
+        """EMA для каждой свечи начиная с индекса period-1 (начальное значение = SMA)."""
+        if len(closes) < period:
+            return []
+        k = 2 / (period + 1)
+        ema = sum(closes[:period]) / period
+        out = [ema]
+        for price in closes[period:]:
+            ema = (price - ema) * k + ema
+            out.append(ema)
+        return out
+
+    @staticmethod
+    def atr_series(highs: List[float], lows: List[float], closes: List[float],
+                   period: int = 14) -> List[float]:
+        """ATR (SMA от True Range) для каждого окна из period свечей."""
+        if len(closes) < period + 1:
+            return []
+        trs = []
+        for i in range(1, len(closes)):
+            trs.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            ))
+        return [sum(trs[i - period:i]) / period for i in range(period, len(trs) + 1)]
+
+    @staticmethod
+    def vwap(highs: List[float], lows: List[float], closes: List[float],
+             volumes: List[float]) -> Optional[float]:
+        """VWAP по typical price за переданное окно свечей."""
+        total_vol = sum(volumes)
+        if total_vol <= 0:
+            return None
+        tp_vol = sum(((h + l + c) / 3) * v for h, l, c, v in zip(highs, lows, closes, volumes))
+        return tp_vol / total_vol
+
+
+def closed_candles(raw_list: List[list]) -> List[Dict[str, float]]:
+    """
+    Преобразовать ответ Bybit get_kline (`result.list`) в список ЗАКРЫТЫХ свечей
+    от старых к новым.
+
+    Bybit возвращает свечи от новых к старым, и первая (самая новая) свеча ещё
+    не закрыта: её объём и close меняются до конца интервала. Индикаторы по
+    незакрытой свече «дёргаются», а объём занижен, поэтому её отбрасываем.
+    """
+    if not raw_list:
+        return []
+    ordered = sorted(raw_list, key=lambda k: int(k[0]))
+    ordered = ordered[:-1]  # последняя после сортировки = текущая незакрытая
+    return [
+        {
+            'start': int(k[0]),
+            'open': float(k[1]),
+            'high': float(k[2]),
+            'low': float(k[3]),
+            'close': float(k[4]),
+            'volume': float(k[5]),
+        }
+        for k in ordered
+    ]
+
 
 # Глобальный экземпляр
 technical_indicators = TechnicalIndicators()

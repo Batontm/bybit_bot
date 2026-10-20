@@ -195,7 +195,9 @@ class PreFilterService:
                     'volume': k[5]
                 })
             
-            return sorted(klines, key=lambda x: int(x['startTime']))
+            klines = sorted(klines, key=lambda x: int(x['startTime']))
+            # Последняя свеча ещё не закрыта (объём занижен, RSI «дёргается») — отбрасываем
+            return klines[:-1]
             
         except Exception as e:
             logger.error(f"❌ Ошибка получения klines {pair}: {e}")

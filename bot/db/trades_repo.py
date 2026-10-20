@@ -20,9 +20,9 @@ class TradesRepository:
             cursor.execute("""
                 INSERT INTO orders (
                     order_id, pair, side, order_type, price, quantity,
-                    filled_quantity, status, created_at, updated_at,
+                    filled_quantity, avg_fill_price, slippage, status, created_at, updated_at,
                     is_tp, is_sl, position_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 order_data['order_id'],
                 order_data['pair'],
@@ -31,6 +31,8 @@ class TradesRepository:
                 order_data.get('price'),
                 order_data['quantity'],
                 order_data.get('filled_quantity', 0),
+                order_data.get('avg_fill_price'),
+                order_data.get('slippage', 0) or 0,
                 order_data['status'],
                 order_data['created_at'],
                 order_data['updated_at'],
@@ -210,8 +212,8 @@ class TradesRepository:
             cursor.execute("""
                 INSERT INTO positions (
                     pair, entry_price, quantity, current_price,
-                    tp_price, sl_price, status, opened_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    tp_price, sl_price, status, opened_at, slippage, commission_paid
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position_data['pair'],
                 position_data['entry_price'],
@@ -220,7 +222,9 @@ class TradesRepository:
                 position_data.get('tp_price'),
                 position_data.get('sl_price'),
                 'OPEN',
-                position_data.get('opened_at', datetime.now(TIMEZONE).isoformat())
+                position_data.get('opened_at', datetime.now(TIMEZONE).isoformat()),
+                position_data.get('slippage', 0) or 0,
+                position_data.get('commission_paid', 0) or 0,
             ))
             
             position_id = cursor.lastrowid

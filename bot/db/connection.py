@@ -173,6 +173,29 @@ class DatabaseConnection:
                 )
             """)
 
+            # 9. Entry signals (воронка входа: баллы по каждому кандидату)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS entry_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    pair TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    score INTEGER,
+                    components TEXT,
+                    metrics TEXT,
+                    vetoes TEXT,
+                    decision TEXT,
+                    reason TEXT,
+                    price REAL,
+                    stop_price REAL,
+                    tp_price REAL,
+                    position_id INTEGER
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_signals_pair_time ON entry_signals(pair, created_at)"
+            )
+
             self._apply_migrations(conn, cursor)
             
             conn.commit()

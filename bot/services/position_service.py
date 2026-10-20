@@ -17,6 +17,7 @@ from config.trading_config import (
 from ..db.trades_repo import TradesRepository
 from ..db.pnl_repo import PnLRepository
 from .websocket_service import websocket_service
+from .instrument_info import instrument_info
 from ..error_tracker import error_tracker
 
 
@@ -24,19 +25,6 @@ from ..error_tracker import error_tracker
 class PositionService:
     """Управление позициями: мониторинг, модификация, закрытие"""
     
-    # Кэш точности для пар (количество десятичных знаков)
-    QTY_PRECISION = {
-        'BTCUSDT': 6,   # BTC: до 0.000001
-        'ETHUSDT': 4,   # ETH: до 0.0001
-        'SOLUSDT': 2,   # SOL: до 0.01
-        'XRPUSDT': 0,   # XRP: целые числа
-        'DOGEUSDT': 0,  # DOGE: целые числа
-        'ADAUSDT': 0,   # ADA: целые числа
-        'AVAXUSDT': 2,
-        'LINKUSDT': 2,
-        'DOTUSDT': 2,
-        'MATICUSDT': 0,
-    }
     
     def __init__(self):
         self.client = HTTP(
@@ -49,48 +37,12 @@ class PositionService:
         self.pnl_repo = PnLRepository()
     
     def _format_qty(self, pair: str, quantity: float) -> str:
-        """
-        Форматировать quantity для Bybit API.
-        Решает ошибку: Order quantity has too many decimals (170137)
-        """
-        precision = self.QTY_PRECISION.get(pair, 2)  # По умолчанию 2 знака
-    
-        # Используем floor, чтобы никогда не округлять вверх (избегаем Insufficient balance)
-        factor = 10 ** precision
-        rounded = math.floor(quantity * factor) / factor
-    
-        if precision == 0:
-            return str(int(rounded))
-        
-        # Форматируем и убираем лишние нули
-        formatted = f"{rounded:.{precision}f}".rstrip('0').rstrip('.')
-        return formatted if formatted else "0"
-    
-    # Кэш точности для цен (количество десятичных знаков)
-    PRICE_PRECISION = {
-        'BTCUSDT': 2,   # BTC: до $0.01
-        'ETHUSDT': 2,   # ETH: до $0.01
-        'SOLUSDT': 2,   # SOL: до $0.01
-        'XRPUSDT': 4,   # XRP: до $0.0001
-        'DOGEUSDT': 5,  # DOGE: до $0.00001
-        'ADAUSDT': 4,   # ADA: до $0.0001
-        'AVAXUSDT': 2,
-        'LINKUSDT': 2,
-        'DOTUSDT': 2,
-        'MATICUSDT': 4,
-    }
-    
+        """Форматировать quantity по шагу инструмента (округление вниз)."""
+        return instrument_info.format_qty(pair, quantity)
+
     def _format_price(self, pair: str, price: float) -> str:
-        """
-        Форматировать price для Bybit API.
-        Решает ошибку: Order price has too many decimals (170134)
-        """
-        precision = self.PRICE_PRECISION.get(pair, 2)  # По умолчанию 2 знака
-        rounded = round(price, precision)
-        
-        # Форматируем и убираем лишние нули
-        formatted = f"{rounded:.{precision}f}".rstrip('0').rstrip('.')
-        return formatted if formatted else "0"
+        """Форматировать price по тику инструмента."""
+        return instrument_info.format_price(pair, price)
     
     def _get_base_coin(self, pair: str) -> str:
         """Извлечь базовую монету из пары (BTCUSDT -> BTC)"""
@@ -388,8 +340,8 @@ class PositionService:
         
         for pos in open_positions:
             pair = pos['pair']
-            entry = pos['entry_price']
-            curr_sl = pos['sl_price']
+            entry = pos.get('avg_entry_price') or pos['entry_price']
+            curr_sl = pos['sl_price'] or 0
             
             # Получаем актуальную цену
             current_price = pos['current_price']

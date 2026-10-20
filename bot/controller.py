@@ -17,7 +17,10 @@ from config.trading_config import (
     ARBITRAGE_RED_MAX_POSITIONS,
     ARBITRAGE_RED_TOTAL_ALLOCATION_PCT,
     ARBITRAGE_RED_MIN_POSITION_SIZE_USD,
-    MAX_SLIPPAGE_PERCENT
+    MAX_SLIPPAGE_PERCENT,
+    ENTRY_STRATEGY,
+    FUNNEL_AI_VETO_ENABLED,
+    FUNNEL_AI_VETO_SCORE,
 )
 from .db.connection import db
 from .services.analysis_service import analysis_service
@@ -29,13 +32,14 @@ from .services.websocket_service import websocket_service
 from .services.prefilter_service import prefilter_service
 from .services.arbitrage_service import arbitrage_service
 from .services.market_regime_service import market_regime_service
+from .services.entry_funnel_service import entry_funnel_service
 from .services.notification_dispatcher import NotificationDispatcher
 from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 from .llm_router import llm_router
 
 
-BOT_VERSION = "v2.1.0"
+BOT_VERSION = "v2.2.0"
 
 
 class BotController:
@@ -313,6 +317,10 @@ class BotController:
         if not allowed:
             logger.info(f"🚦 {regime_reason}. Пропускаем поиск сигналов.")
             return
+
+        if ENTRY_STRATEGY == "FUNNEL":
+            await self._check_signals_funnel()
+            return
         
         logger.info("🔍 Этап 1: Pre-filter (технический анализ)...")
         
@@ -397,6 +405,83 @@ class BotController:
             except Exception as e:
                 logger.error(f"❌ Ошибка проверки сигнала {pair}: {e}")
     
+    async def _check_signals_funnel(self):
+        """
+        Воронка входа (ENTRY_STRATEGY = "FUNNEL"):
+        отбор пар → тренд 4h → откат 1h → триггер 15m → поток ордеров/OI/funding →
+        балл >= FUNNEL_MIN_SCORE → корреляция → AI-вето → лимитный вход.
+        За цикл открывается не больше одной позиции.
+        """
+        open_positions = self.trading_service.trades_repo.get_open_positions()
+        open_pairs = [p['pair'] for p in open_positions]
+
+        can_trade, risk_reason = self.trading_service.check_risk_limits()
+        if not can_trade:
+            logger.info(f"🛑 Воронка: новые входы запрещены — {risk_reason}")
+            return
+
+        candidates = await asyncio.to_thread(
+            entry_funnel_service.scan, exclude=open_pairs, always_include=self.fixed_pairs
+        )
+        repo = entry_funnel_service.repo
+
+        for c in candidates:
+            pair, sid = c['pair'], c.get('signal_id')
+
+            if self._is_pair_banned(pair):
+                repo.update(sid, decision='SKIP', reason='пара забанена (проскальзывание)')
+                continue
+
+            blocked, why = await asyncio.to_thread(entry_funnel_service.correlation_block, pair, open_pairs)
+            if blocked:
+                logger.info(f"🔗 {pair}: пропуск — {why}")
+                repo.update(sid, decision='SKIP', reason=why)
+                continue
+
+            if FUNNEL_AI_VETO_ENABLED:
+                summary = entry_funnel_service.funnel_summary(c)
+                analysis = await self.analysis_service.analyze_pair(
+                    pair, use_cache=False, extra_context={'funnel_summary': summary}
+                )
+                if not analysis:
+                    repo.update(sid, decision='SKIP', reason='AI недоступен — вход без проверки не делаем')
+                    logger.warning(f"⚠️ {pair}: AI недоступен, пропуск")
+                    continue
+                ai_score, ai_signal = analysis.get('score', 0), analysis.get('signal', 'WAIT')
+                if ai_signal == 'AVOID' or ai_score < FUNNEL_AI_VETO_SCORE:
+                    why = f"AI вето: {ai_signal}, score={ai_score}. {analysis.get('summary', '')[:120]}"
+                    logger.info(f"🤖 {pair}: {why}")
+                    repo.update(sid, decision='AI_VETO', reason=why)
+                    continue
+
+            position, err = await self.trading_service.open_position_with_plan(pair, c['plan'])
+            if not position:
+                repo.update(sid, decision='FAILED', reason=err or 'ошибка открытия')
+                logger.warning(f"⚠️ {pair}: не удалось открыть — {err}")
+                if err and 'лимит' in err:
+                    break
+                continue
+
+            repo.update(sid, decision='OPENED', position_id=position['position_id'])
+            entry = position['entry_price']
+            stop_pct = (entry - position['sl_price']) / entry * 100
+            tp_pct = (position['tp_price'] - entry) / entry * 100
+            await self._send_notification(
+                f"✅ Позиция открыта: {pair} @ ${entry:.6g}\n"
+                f"🧭 Балл воронки: {c['score']}/100 | триггер: {c['metrics'].get('trigger')}\n"
+                f"🛑 SL ${position['sl_price']:.6g} (-{stop_pct:.2f}%) | 🎯 TP ${position['tp_price']:.6g} (+{tp_pct:.2f}%)"
+            )
+
+            slip = float(position.get('slippage') or 0)
+            if abs(slip) > MAX_SLIPPAGE_PERCENT:
+                await self._send_notification(
+                    f"💸 Проскальзывание {pair}: {slip*100:.2f}% > {MAX_SLIPPAGE_PERCENT*100:.2f}%"
+                )
+                exceed = self._record_slippage_event(pair, "OPEN", slip)
+                if exceed >= 3:
+                    await self._ban_pair_for_slippage(pair, exceed)
+            break
+
     def _log_rejection(self, pair: str, analysis: Dict, reason: str):
         """Записать причину отказа от входа в сделку для анализа"""
         try:

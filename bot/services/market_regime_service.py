@@ -8,7 +8,7 @@ from pybit.unified_trading import HTTP
 
 from config.api_config import BYBIT_TESTNET
 from config.settings import logger, TIMEZONE
-from .indicators_service import TechnicalIndicators
+from .indicators_service import TechnicalIndicators, closed_candles
 
 
 @dataclass
@@ -28,15 +28,18 @@ class MarketRegimeService:
 
     Variant B: if regime is bad -> block ALL new trades.
 
-    Heuristics (4H, BTCUSDT):
-    - allowed if close > EMA200 and RSI(14) >= 50
+    Heuristics (4H, BTCUSDT, только закрытые свечи):
+    - allowed if close > EMA200 and RSI(14) >= RSI_MIN and ATR не в панике
+    - ATR-паника: текущий ATR14 > ATR_SPIKE_MULTIPLIER × среднего ATR14 за ATR_AVG_WINDOWS окон
     """
 
     REGIME_PAIR = "BTCUSDT"
     INTERVAL = "240"  # 4H
     EMA_PERIOD = 200
     RSI_PERIOD = 14
+    RSI_MIN = 40
     ATR_SPIKE_MULTIPLIER = 2.0  # Блокировка если ATR > 2x от среднего (паника)
+    ATR_AVG_WINDOWS = 30        # Сколько предыдущих значений ATR усреднять
 
     def __init__(self) -> None:
         # Read-only market data. Use mainnet for stable candles even when trading on testnet.
@@ -77,22 +80,25 @@ class MarketRegimeService:
                     checked_at=now,
                 )
 
-            candles = list(reversed(resp["result"]["list"]))
-            closes = [float(c[4]) for c in candles]
-            highs = [float(c[2]) for c in candles]
-            lows = [float(c[3]) for c in candles]
+            candles = closed_candles(resp["result"]["list"])
+            closes = [c['close'] for c in candles]
+            highs = [c['high'] for c in candles]
+            lows = [c['low'] for c in candles]
 
             price = closes[-1] if closes else None
             ema200 = TechnicalIndicators.calculate_ema(closes, self.EMA_PERIOD)
             rsi14 = TechnicalIndicators.calculate_rsi(closes, self.RSI_PERIOD)
 
             # ATR volatility spike detection
+            # Раньше «средний» ATR считался как ATR14, сдвинутый на одну свечу, — отношение
+            # всегда было ~1.0 и фильтр паники никогда не срабатывал.
             atr_ratio = None
-            if len(closes) >= 31:
-                current_atr = TechnicalIndicators.calculate_atr(highs, lows, closes, 14)
-                # Средний ATR за предыдущие 30 свечей (исключая последнюю)
-                avg_atr = TechnicalIndicators.calculate_atr(highs[:-1], lows[:-1], closes[:-1], 14)
-                if current_atr and avg_atr and avg_atr > 0:
+            atrs = TechnicalIndicators.atr_series(highs, lows, closes, 14)
+            if len(atrs) > self.ATR_AVG_WINDOWS:
+                current_atr = atrs[-1]
+                prev = atrs[-(self.ATR_AVG_WINDOWS + 1):-1]
+                avg_atr = sum(prev) / len(prev)
+                if avg_atr > 0:
                     atr_ratio = current_atr / avg_atr
 
             if price is None or ema200 is None or rsi14 is None:
@@ -113,20 +119,20 @@ class MarketRegimeService:
             # ATR spike check — блокировка при панике на рынке
             atr_blocked = atr_ratio is not None and atr_ratio > self.ATR_SPIKE_MULTIPLIER
 
-            ok = (price > ema200) and (rsi14 >= 40) and (not atr_blocked)
+            ok = (price > ema200) and (rsi14 >= self.RSI_MIN) and (not atr_blocked)
             if ok:
                 label = "ЗЕЛЕНЫЙ"
                 atr_info = f", ATR_ratio={atr_ratio:.2f}" if atr_ratio else ""
                 reason = (
-                    f"Режим {label}: BTC 4H close={price:.2f} > EMA200={ema200:.2f} и RSI14={rsi14:.2f} >= 50{atr_info}"
+                    f"Режим {label}: BTC 4H close={price:.2f} > EMA200={ema200:.2f} и RSI14={rsi14:.2f} >= {self.RSI_MIN}{atr_info}"
                 )
             else:
                 label = "КРАСНЫЙ"
                 parts = []
                 if not (price > ema200):
                     parts.append(f"close={price:.2f} <= EMA200={ema200:.2f}")
-                if not (rsi14 >= 40):
-                    parts.append(f"RSI14={rsi14:.2f} < 50")
+                if not (rsi14 >= self.RSI_MIN):
+                    parts.append(f"RSI14={rsi14:.2f} < {self.RSI_MIN}")
                 if atr_blocked:
                     parts.append(f"ATR spike={atr_ratio:.2f}x > {self.ATR_SPIKE_MULTIPLIER}x")
                 reason = f"Режим {label}: запрет новых сделок ({', '.join(parts)})"

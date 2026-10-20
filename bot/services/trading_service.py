@@ -3,6 +3,7 @@
 """
 from typing import Dict, Optional, Tuple, List
 from datetime import datetime, timedelta
+import asyncio
 import math
 from pybit.unified_trading import HTTP
 from config.settings import logger, TIMEZONE
@@ -33,11 +34,13 @@ from config.trading_config import (
     DCA_TRIGGER_PERCENT,
     DCA_MAX_ENTRIES,
     DCA_MIN_SCORE,
-    DCA_POSITION_MULTIPLIER
+    DCA_POSITION_MULTIPLIER,
+    FUNNEL_LIMIT_TIMEOUT_SEC,
 )
 from ..db.trades_repo import TradesRepository
 from ..db.pnl_repo import PnLRepository
 from .balance_service import balance_service
+from .instrument_info import instrument_info
 from ..error_tracker import error_tracker
 
 
@@ -55,46 +58,12 @@ class TradingService:
         self.pnl_repo = PnLRepository()
     
     def _format_qty(self, pair: str, quantity: float) -> str:
-        """
-        Форматировать quantity для Bybit API.
-        Решает ошибку: Order quantity has too many decimals (170137)
-        """
-        precision = self._get_qty_precision(pair)
-    
-        # Используем floor, чтобы никогда не округлять вверх (избегаем Insufficient balance)
-        factor = 10 ** precision
-        rounded = math.floor(quantity * factor) / factor
-        
-        if precision == 0:
-            return str(int(rounded))
-        
-        formatted = f"{rounded:.{precision}f}".rstrip('0').rstrip('.')
-        return formatted if formatted else "0"
-    
-    # Кэш точности для цен (количество десятичных знаков)
-    PRICE_PRECISION = {
-        'BTCUSDT': 2,   # BTC: до $0.01
-        'ETHUSDT': 2,   # ETH: до $0.01
-        'SOLUSDT': 2,   # SOL: до $0.01
-        'XRPUSDT': 4,   # XRP: до $0.0001
-        'DOGEUSDT': 5,  # DOGE: до $0.00001
-        'ADAUSDT': 4,   # ADA: до $0.0001
-        'AVAXUSDT': 2,
-        'LINKUSDT': 2,
-        'DOTUSDT': 2,
-        'MATICUSDT': 4,
-    }
-    
+        """Форматировать quantity по шагу инструмента (округление вниз)."""
+        return instrument_info.format_qty(pair, quantity)
+
     def _format_price(self, pair: str, price: float) -> str:
-        """
-        Форматировать price для Bybit API.
-        Решает ошибку: Order price has too many decimals (170134)
-        """
-        precision = self.PRICE_PRECISION.get(pair, 2)  # По умолчанию 2 знака
-        rounded = round(price, precision)
-        
-        formatted = f"{rounded:.{precision}f}".rstrip('0').rstrip('.')
-        return formatted if formatted else "0"
+        """Форматировать price по тику инструмента."""
+        return instrument_info.format_price(pair, price)
     
     def check_risk_limits(self) -> Tuple[bool, str]:
         """
@@ -129,18 +98,35 @@ class TradingService:
             if daily_pnl < 0 and daily_loss_percent >= MAX_DAILY_LOSS:
                 return False, f"Достигнут дневной лимит убытка ({MAX_DAILY_LOSS*100}%)"
         
-        # 5. Проверка суммарного риска по открытым позициям
-        total_risk = sum(
-            abs(pos.get('unrealized_pnl', 0)) 
-            for pos in open_positions
-        )
-        
+        # 5. Проверка суммарного риска по открытым позициям.
+        # Риск позиции = сколько потеряем, если сработает стоп: (вход − SL) × количество.
+        # Раньше здесь суммировался |нереализованный PnL| — у свежей позиции он ≈ 0,
+        # поэтому лимит фактически не работал.
+        total_risk = self.open_risk_usdt(open_positions)
+
         if deposit > 0:
             total_risk_percent = total_risk / deposit
-            if total_risk_percent >= MAX_TOTAL_RISK:
-                return False, f"Достигнут лимит суммарного риска ({MAX_TOTAL_RISK*100}%)"
-        
+            if total_risk_percent + MAX_RISK_PER_TRADE > MAX_TOTAL_RISK:
+                return False, (f"Достигнут лимит суммарного риска: открыто {total_risk_percent*100:.2f}% "
+                               f"+ новая сделка {MAX_RISK_PER_TRADE*100:.2f}% > {MAX_TOTAL_RISK*100:.1f}%")
+
         return True, "Все лимиты в норме"
+
+    @staticmethod
+    def open_risk_usdt(open_positions: List[Dict]) -> float:
+        """Суммарный риск открытых позиций до их стопов (позиции в безубытке = 0)."""
+        total = 0.0
+        for pos in open_positions:
+            entry = pos.get('avg_entry_price') or pos.get('entry_price') or 0
+            sl = pos.get('sl_price') or 0
+            qty = pos.get('quantity') or 0
+            if entry <= 0 or qty <= 0:
+                continue
+            if sl <= 0:
+                # позиция без стопа — считаем риск по дефолтному SL
+                sl = entry * (1 - DEFAULT_SL_PERCENT)
+            total += max(0.0, entry - sl) * qty
+        return total
     
     def can_open_position_for_pair(self, pair: str) -> Tuple[bool, str]:
         """
@@ -286,88 +272,216 @@ class TradingService:
             position_size = position_size * INITIAL_POSITION_PERCENT
             logger.info(f"📊 Пирамидинг: {INITIAL_POSITION_PERCENT*100:.0f}% от полного размера")
         
-        # POSITION SIZING по AI SCORE: чем выше score, тем больше позиция
+        # POSITION SIZING по AI SCORE: слабый сигнал — меньше позиция.
+        # Множитель ограничен 1.0: раньше при score > 80 он доходил до 1.2 и риск
+        # сделки превышал MAX_RISK_PER_TRADE.
         ai_score = analysis.get('score', 70)
-        score_multiplier = max(0.5, min(1.2, ai_score / 80))  # от 0.5 до 1.2
+        score_multiplier = max(0.5, min(1.0, ai_score / 80))
         position_size = position_size * score_multiplier
         logger.info(f"📊 AI Score sizing: score={ai_score}, multiplier={score_multiplier:.2f}")
         
-        # Проверка минимального размера
-        position_value_usdt = position_size * current_price
-        if position_value_usdt < MIN_ORDER_SIZE_USD:
-            reason = f"Позиция слишком мала: {position_value_usdt:.2f} USDT < {MIN_ORDER_SIZE_USD}"
+        return await self._execute_entry(
+            pair, position_size, current_price, tp_price, sl_price, limit_price=None
+        )
+
+    # ------------------------------------------------------------------ FUNNEL
+
+    async def open_position_with_plan(self, pair: str, plan, *, use_limit: bool = True
+                                      ) -> Tuple[Optional[Dict], Optional[str]]:
+        """
+        Открыть позицию по плану воронки (entry_funnel.TradePlan):
+        размер — от стопа за минимумом отката (риск = MAX_RISK_PER_TRADE),
+        вход — лимитный post-only по лучшему биду, при неисполнении — отмена.
+        """
+        can_trade, reason = self.check_risk_limits()
+        if not can_trade:
+            return None, reason
+        can_open, reason = self.can_open_position_for_pair(pair)
+        if not can_open:
+            return None, reason
+
+        try:
+            ticker = self.client.get_tickers(category="spot", symbol=pair)
+            row = ticker['result']['list'][0]
+            bid = float(row.get('bid1Price') or 0)
+            last = float(row['lastPrice'])
+        except Exception as e:
+            error_tracker.add_error("Bybit", "PriceError", str(e))
+            return None, f"Не удалось получить цену {pair}: {e}"
+
+        entry = bid if (use_limit and bid > 0) else last
+        if entry <= plan.stop:
+            return None, f"Цена {entry} уже ниже стопа {plan.stop:.6g}"
+
+        # Пересчитываем тейк от реальной цены входа, стоп — структурный уровень
+        risk_per_unit = entry - plan.stop
+        r_multiple = (plan.take_profit - plan.entry) / plan.risk_per_unit if plan.risk_per_unit > 0 else 2.5
+        tp_price = entry + r_multiple * risk_per_unit
+
+        position_size = balance_service.calculate_position_size(MAX_RISK_PER_TRADE, entry, plan.stop)
+        if position_size <= 0:
+            return None, "Не удалось рассчитать размер позиции"
+
+        # Не тратим больше свободного USDT
+        try:
+            free = float(balance_service.get_usdt_balance().get('free', 0))
+            if free > 0 and position_size * entry > free * 0.98:
+                position_size = free * 0.98 / entry
+                logger.info(f"📊 {pair}: размер урезан до свободного баланса ({free:.2f} USDT)")
+        except Exception:
+            pass
+
+        return await self._execute_entry(
+            pair, position_size, entry, tp_price, plan.stop,
+            limit_price=entry if use_limit and bid > 0 else None,
+        )
+
+    async def _execute_entry(self, pair: str, quantity: float, expected_price: float,
+                             tp_price: float, sl_price: float, *,
+                             limit_price: Optional[float]) -> Tuple[Optional[Dict], Optional[str]]:
+        """
+        Разместить ордер на покупку, дождаться исполнения и записать позицию
+        по ФАКТИЧЕСКОЙ средней цене и количеству (за вычетом комиссии в монете).
+        """
+        if quantity * expected_price < MIN_ORDER_SIZE_USD:
+            reason = f"Позиция слишком мала: {quantity * expected_price:.2f} USDT < {MIN_ORDER_SIZE_USD}"
             logger.warning(f"⚠️ {reason}")
             return None, reason
-        
-        # Получаем правильное округление для пары
-        qty_precision = self._get_qty_precision(pair)
-        position_size = round(position_size, qty_precision)
-        
-        # Размещаем рыночный ордер BUY
+
+        qty_str = self._format_qty(pair, quantity)
+        if float(qty_str) <= 0:
+            return None, "Количество после округления = 0"
+
+        params = dict(category="spot", symbol=pair, side="Buy", qty=qty_str, marketUnit="baseCoin")
+        if limit_price is not None:
+            params.update(orderType="Limit", price=self._format_price(pair, limit_price),
+                          timeInForce="PostOnly")
+            timeout = FUNNEL_LIMIT_TIMEOUT_SEC
+        else:
+            params.update(orderType="Market")
+            timeout = 15
+
         try:
-            order_response = self.client.place_order(
-                category="spot",
-                symbol=pair,
-                side="Buy",
-                orderType="Market",
-                qty=str(position_size),
-                marketUnit="baseCoin"
-            )
-            
-            if order_response['retCode'] != 0:
-                error_msg = f"Ошибка размещения ордера: {order_response['retMsg']}"
-                error_tracker.add_error("Bybit", "OrderError", error_msg)
-                logger.error(f"❌ {error_msg}")
-                return None, error_msg
-            
-            order_id = order_response['result']['orderId']
-            
-            logger.info(f"✅ Ордер размещён: {pair} | {position_size} | ${current_price}")
-            
-            # Сохраняем ордер в БД
-            order_data = {
-                'order_id': order_id,
-                'pair': pair,
-                'side': 'Buy',
-                'order_type': 'Market',
-                'price': current_price,
-                'quantity': position_size,
-                'status': 'New',
-                'created_at': datetime.now(TIMEZONE).isoformat(),
-                'updated_at': datetime.now(TIMEZONE).isoformat()
-            }
-            
-            self.trades_repo.create_order(order_data)
-            
-            # Создаём позицию
-            position_data = {
-                'pair': pair,
-                'entry_price': current_price,
-                'quantity': position_size,
-                'tp_price': tp_price,
-                'sl_price': sl_price,
-                'opened_at': datetime.now(TIMEZONE).isoformat()
-            }
-            
-            position_id = self.trades_repo.create_position(position_data)
-            
-            # Размещаем TP и SL ордера
-            await self._place_tp_sl_orders(pair, position_size, tp_price, sl_price, position_id)
-            
-            return {
-                'position_id': position_id,
-                'order_id': order_id,
-                'pair': pair,
-                'entry_price': current_price,
-                'quantity': position_size,
-                'tp_price': tp_price,
-                'sl_price': sl_price
-            }, None
-            
+            resp = self.client.place_order(**params)
         except Exception as e:
             error_tracker.add_error("Bybit", "OrderError", str(e))
-            logger.error(f"❌ Ошибка открытия позиции: {e}")
             return None, str(e)
+        if resp.get('retCode') != 0:
+            msg = f"Ошибка размещения ордера: {resp.get('retMsg')}"
+            error_tracker.add_error("Bybit", "OrderError", msg)
+            logger.error(f"❌ {msg}")
+            return None, msg
+
+        order_id = resp['result']['orderId']
+        logger.info(f"📨 {pair}: ордер {params['orderType']} {qty_str} @ "
+                    f"{params.get('price', 'market')} размещён, ждём исполнения...")
+
+        fill = await self._wait_fill(pair, order_id, timeout)
+        filled_qty, avg_price, fee = fill['filled_qty'], fill['avg_price'], fill['fee']
+
+        now = datetime.now(TIMEZONE).isoformat()
+        if filled_qty <= 0 or avg_price <= 0:
+            self.trades_repo.create_order({
+                'order_id': order_id, 'pair': pair, 'side': 'Buy',
+                'order_type': params['orderType'], 'price': limit_price or expected_price,
+                'quantity': float(qty_str), 'status': fill['status'] or 'Cancelled',
+                'created_at': now, 'updated_at': now,
+            })
+            return None, f"Ордер не исполнился за {timeout}с ({fill['status']})"
+
+        # Комиссия спотовой покупки списывается в базовой монете
+        net_qty = filled_qty - fee if 0 < fee < filled_qty * 0.01 else filled_qty
+        slippage = (avg_price - expected_price) / expected_price if expected_price else 0.0
+
+        try:
+            self.trades_repo.create_order({
+                'order_id': order_id, 'pair': pair, 'side': 'Buy',
+                'order_type': params['orderType'], 'price': limit_price or expected_price,
+                'quantity': float(qty_str), 'filled_quantity': filled_qty,
+                'avg_fill_price': avg_price, 'slippage': slippage,
+                'status': fill['status'] or 'Filled', 'created_at': now, 'updated_at': now,
+            })
+        except Exception as e:
+            # Монеты уже куплены — запись ордера не должна мешать поставить TP/SL
+            logger.error(f"❌ {pair}: не удалось записать ордер {order_id} в БД: {e}")
+
+        if net_qty * avg_price < MIN_ORDER_SIZE_USD:
+            logger.warning(f"⚠️ {pair}: исполнено только {net_qty} (< {MIN_ORDER_SIZE_USD} USDT) — "
+                           f"слишком мало для TP/SL, остаток останется на балансе")
+            return None, "Исполнена слишком малая часть ордера"
+
+        # Стоп не может оказаться выше фактической цены
+        if sl_price >= avg_price:
+            sl_price = avg_price * (1 - DEFAULT_SL_PERCENT)
+
+        position_id = self.trades_repo.create_position({
+            'pair': pair, 'entry_price': avg_price, 'quantity': net_qty,
+            'tp_price': tp_price, 'sl_price': sl_price, 'opened_at': now,
+            'slippage': slippage, 'commission_paid': fee * avg_price,
+        })
+        try:
+            from ..db.connection import get_transaction
+            with get_transaction() as conn:
+                conn.execute("UPDATE orders SET position_id = ? WHERE order_id = ?", (position_id, order_id))
+        except Exception:
+            pass
+
+        await self._place_tp_sl_orders(pair, net_qty, tp_price, sl_price, position_id)
+        logger.info(f"✅ {pair}: позиция #{position_id} {net_qty} @ {avg_price} "
+                    f"(ожидали {expected_price}, проскальзывание {slippage*100:+.3f}%)")
+
+        return {
+            'position_id': position_id, 'order_id': order_id, 'pair': pair,
+            'entry_price': avg_price, 'quantity': net_qty,
+            'tp_price': tp_price, 'sl_price': sl_price, 'slippage': slippage,
+        }, None
+
+    async def _wait_fill(self, pair: str, order_id: str, timeout: float) -> Dict:
+        """
+        Опрашивать ордер до исполнения/отмены. По таймауту отменить остаток.
+        Returns: {status, filled_qty, avg_price, fee}
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        last: Dict = {}
+        terminal = {'Filled', 'Cancelled', 'Rejected', 'PartiallyFilledCanceled', 'Deactivated'}
+        while True:
+            last = self._get_order(pair, order_id) or last
+            if last.get('orderStatus') in terminal:
+                break
+            if asyncio.get_event_loop().time() >= deadline:
+                try:
+                    self.client.cancel_order(category="spot", symbol=pair, orderId=order_id)
+                    logger.info(f"⌛ {pair}: ордер {order_id} не исполнился за {timeout:.0f}с — отменён")
+                except Exception as e:
+                    logger.debug(f"cancel {order_id}: {e}")
+                await asyncio.sleep(1)
+                last = self._get_order(pair, order_id) or last
+                break
+            await asyncio.sleep(2)
+
+        def f(key):
+            try:
+                return float(last.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        return {
+            'status': last.get('orderStatus', ''),
+            'filled_qty': f('cumExecQty'),
+            'avg_price': f('avgPrice'),
+            'fee': f('cumExecFee'),
+        }
+
+    def _get_order(self, pair: str, order_id: str) -> Optional[Dict]:
+        """Найти ордер среди открытых, затем в истории."""
+        for getter in (self.client.get_open_orders, self.client.get_order_history):
+            try:
+                resp = getter(category="spot", symbol=pair, orderId=order_id)
+                if resp.get('retCode') == 0 and resp['result']['list']:
+                    return resp['result']['list'][0]
+            except Exception as e:
+                logger.debug(f"get order {order_id}: {e}")
+        return None
     
     async def _place_tp_sl_orders(self, pair: str, quantity: float, 
                                    tp_price: float, sl_price: float,
@@ -440,105 +554,144 @@ class TradingService:
             error_tracker.add_error("Bybit", "TPSLError", str(e))
             logger.error(f"❌ Ошибка размещения TP/SL: {e}")
     
+    def get_add_action(self, position: Dict) -> Optional[str]:
+        """
+        Нужна ли докупка по позиции. Возвращает "PYRAMIDING", "DCA" или None.
+        (Метод вызывается контроллером каждые 2 минуты; до v2.2 его не было,
+        задача падала с AttributeError, и докупки не работали вообще.)
+        """
+        if not (PYRAMIDING_ENABLED or DCA_ENABLED):
+            return None
+        if position.get('breakeven_activated'):
+            return None
+        dca_count = position.get('dca_count') or 0
+        entry = position.get('avg_entry_price') or position.get('entry_price') or 0
+        current = position.get('current_price') or 0
+        if entry <= 0 or current <= 0:
+            return None
+        drawdown = (current - entry) / entry
+
+        if PYRAMIDING_ENABLED and dca_count == 0:
+            return "PYRAMIDING" if drawdown <= PYRAMIDING_TRIGGER else None
+        if DCA_ENABLED and dca_count < DCA_MAX_ENTRIES:
+            return "DCA" if drawdown <= DCA_TRIGGER_PERCENT else None
+        return None
+
+    def check_dca_trigger(self, position: Dict) -> bool:
+        """Совместимость: True, если нужна любая докупка."""
+        return self.get_add_action(position) is not None
+
     async def add_to_position(self, position_id: int, analysis: Dict) -> Optional[Dict]:
         """
-        Smart DCA: докупить позицию для усреднения
-        
-        Args:
-            position_id: ID позиции для докупки
-            analysis: Результат AI анализа
-            
-        Returns:
-            Dict с данными докупки или None
+        Докупка (пирамидинг / Smart DCA). После докупки объём TP и SL ордеров
+        увеличивается до нового количества — иначе докупленные монеты остаются без стопа.
         """
-        if not DCA_ENABLED:
-            return None
-        
         position = self.trades_repo.get_position_by_id(position_id)
         if not position or position['status'] != 'OPEN':
             return None
-        
-        pair = position['pair']
-        dca_count = position.get('dca_count', 0)
-        
-        # Проверяем лимит докупок
-        if dca_count >= DCA_MAX_ENTRIES:
-            logger.debug(f"DCA {pair}: достигнут лимит ({DCA_MAX_ENTRIES})")
+
+        action = self.get_add_action(position)
+        if not action:
             return None
-        
-        # Проверяем AI score
+
+        pair = position['pair']
+        dca_count = position.get('dca_count') or 0
+
         score = analysis.get('score', 0)
         if score < DCA_MIN_SCORE:
-            logger.debug(f"DCA {pair}: score {score} < {DCA_MIN_SCORE}")
+            logger.debug(f"{action} {pair}: score {score} < {DCA_MIN_SCORE}")
             return None
-        
+
         try:
-            # Получаем текущую цену
             ticker = self.client.get_tickers(category="spot", symbol=pair)
             current_price = float(ticker['result']['list'][0]['lastPrice'])
-            
-            # Размер докупки = 50% от начальной позиции
-            original_qty = position['quantity']
-            dca_qty = original_qty * DCA_POSITION_MULTIPLIER
-            
-            # Проверяем минимальный размер
-            if dca_qty * current_price < MIN_ORDER_SIZE_USD:
-                logger.warning(f"DCA {pair}: слишком маленькая докупка")
-                return None
-            
-            # ПРОВЕРКА БАЛАНСА ПЕРЕД ДОКУПКОЙ
-            balance = balance_service.get_usdt_balance()
-            free_balance = balance.get('free', 0)
-            order_cost = dca_qty * current_price
-            
-            if free_balance < order_cost:
-                logger.warning(f"⚠️ DCA {pair}: Недостаточно баланса для докупки. Нужно {order_cost:.2f} USDT, есть {free_balance:.2f} USDT")
-                return None
+        except Exception as e:
+            logger.error(f"❌ {action} {pair}: нет цены ({e})")
+            return None
 
-            # Округляем количество для Bybit API (используем правильную точность)
-            dca_qty_str = self._format_qty(pair, dca_qty)
-            
-            # Размещаем ордер
-            order_response = self.client.place_order(
-                category="spot",
-                symbol=pair,
-                side="Buy",
-                orderType="Market",
-                qty=dca_qty_str,
-                marketUnit="baseCoin"
+        old_qty = position['quantity']
+        if action == "PYRAMIDING":
+            add_qty = old_qty * PYRAMIDING_ADD_PERCENT / max(INITIAL_POSITION_PERCENT, 1e-9)
+        else:
+            add_qty = old_qty * DCA_POSITION_MULTIPLIER
+
+        if add_qty * current_price < MIN_ORDER_SIZE_USD:
+            logger.warning(f"{action} {pair}: слишком маленькая докупка")
+            return None
+
+        free_balance = balance_service.get_usdt_balance().get('free', 0)
+        if free_balance < add_qty * current_price:
+            logger.warning(f"⚠️ {action} {pair}: недостаточно USDT ({free_balance:.2f})")
+            return None
+
+        try:
+            resp = self.client.place_order(
+                category="spot", symbol=pair, side="Buy", orderType="Market",
+                qty=self._format_qty(pair, add_qty), marketUnit="baseCoin",
             )
-            
-            if order_response['retCode'] != 0:
-                logger.error(f"❌ DCA {pair}: {order_response['retMsg']}")
+            if resp.get('retCode') != 0:
+                logger.error(f"❌ {action} {pair}: {resp.get('retMsg')}")
                 return None
-            
-            order_id = order_response['result']['orderId']
-            
-            # Расчёт новой средней цены
+            order_id = resp['result']['orderId']
+
+            fill = await self._wait_fill(pair, order_id, 15)
+            filled, avg_fill, fee = fill['filled_qty'], fill['avg_price'], fill['fee']
+            if filled <= 0 or avg_fill <= 0:
+                logger.error(f"❌ {action} {pair}: ордер не исполнился ({fill['status']})")
+                return None
+            net_add = filled - fee if 0 < fee < filled * 0.01 else filled
+            slippage = (avg_fill - current_price) / current_price
+
             old_avg = position.get('avg_entry_price') or position['entry_price']
-            old_qty = position['quantity']
-            new_qty = old_qty + dca_qty
-            new_avg = ((old_avg * old_qty) + (current_price * dca_qty)) / new_qty
-            
-            # Обновляем позицию
+            new_qty = old_qty + net_add
+            new_avg = (old_avg * old_qty + avg_fill * net_add) / new_qty
             self._update_position_dca(position_id, new_qty, new_avg, dca_count + 1)
-            
-            logger.info(f"➕ DCA {pair}: докупка {dca_qty:.6f} @ {current_price:.4f} | Новая средняя: {new_avg:.4f}")
-            
+
+            now = datetime.now(TIMEZONE).isoformat()
+            self.trades_repo.create_order({
+                'order_id': order_id, 'pair': pair, 'side': 'Buy', 'order_type': 'Market',
+                'price': current_price, 'quantity': add_qty, 'filled_quantity': filled,
+                'avg_fill_price': avg_fill, 'slippage': slippage, 'status': fill['status'] or 'Filled',
+                'position_id': position_id, 'created_at': now, 'updated_at': now,
+            })
+
+            await self._resize_protection(position_id, pair, new_qty)
+
+            logger.info(f"➕ {action} {pair}: +{net_add:.6f} @ {avg_fill:.6g} | средняя {new_avg:.6g}")
             return {
-                'order_id': order_id,
-                'pair': pair,
-                'dca_qty': dca_qty,
-                'price': current_price,
-                'new_avg': new_avg,
-                'new_qty': new_qty,
-                'dca_count': dca_count + 1
+                'action': action, 'order_id': order_id, 'pair': pair,
+                'dca_qty': net_add, 'price': avg_fill, 'new_avg': new_avg,
+                'new_qty': new_qty, 'dca_count': dca_count + 1, 'slippage': slippage,
             }
-            
         except Exception as e:
             error_tracker.add_error("Bybit", "DCAError", str(e))
-            logger.error(f"❌ Ошибка DCA {pair}: {e}")
+            logger.error(f"❌ Ошибка {action} {pair}: {e}")
             return None
+
+    async def _resize_protection(self, position_id: int, pair: str, new_qty: float) -> None:
+        """Увеличить qty у активных TP и SL ордеров позиции после докупки."""
+        from ..db.connection import get_db
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT order_id, is_tp, is_sl FROM orders
+                WHERE position_id = ? AND (is_tp = 1 OR is_sl = 1)
+                  AND status IN ('New', 'PartiallyFilled', 'Untriggered')
+            """, (position_id,)).fetchall()
+        qty_str = self._format_qty(pair, new_qty)
+        for r in rows:
+            try:
+                resp = self.client.amend_order(category="spot", symbol=pair,
+                                               orderId=r['order_id'], qty=qty_str)
+                if resp.get('retCode') == 0:
+                    from ..db.connection import get_transaction
+                    with get_transaction() as conn:
+                        conn.execute("UPDATE orders SET quantity = ? WHERE order_id = ?",
+                                     (float(qty_str), r['order_id']))
+                else:
+                    logger.error(f"❌ {pair}: не удалось изменить объём ордера {r['order_id']}: "
+                                 f"{resp.get('retMsg')}")
+            except Exception as e:
+                logger.error(f"❌ {pair}: ошибка изменения объёма ордера {r['order_id']}: {e}")
     
     def _update_position_dca(self, position_id: int, new_qty: float, 
                               new_avg: float, dca_count: int) -> None:
@@ -552,71 +705,9 @@ class TradingService:
                 WHERE id = ?
             """, (new_qty, new_avg, dca_count, position_id))
     
-    def check_dca_trigger(self, position: Dict) -> bool:
-        """Проверить, нужна ли докупка для позиции"""
-        if not DCA_ENABLED:
-            return False
-        
-        dca_count = position.get('dca_count', 0)
-        if dca_count >= DCA_MAX_ENTRIES:
-            return False
-        
-        entry = position.get('avg_entry_price') or position['entry_price']
-        current = position.get('current_price', 0)
-        
-        if current <= 0:
-            return False
-        
-        # Расчёт просадки
-        drawdown = (current - entry) / entry
-        
-        # ПИРАМИДИНГ: первая докупка при -0.5%, последующие при -1.5%
-        if PYRAMIDING_ENABLED and dca_count == 0:
-            trigger = PYRAMIDING_TRIGGER  # -0.5%
-            logger.debug(f"Пирамидинг триггер: {trigger*100:.1f}%, просадка: {drawdown*100:.2f}%")
-        else:
-            trigger = DCA_TRIGGER_PERCENT  # -1.5%
-        
-        return drawdown <= trigger
-    
     def _get_qty_precision(self, pair: str) -> int:
-        """
-        Получить правильное количество десятичных знаков для пары.
-        Bybit имеет разные требования для разных монет.
-        """
-        # Кэш для часто используемых пар (часто используемые значения)
-        PRECISION_CACHE = {
-            'BTCUSDT': 6,   # BTC: до 0.000001
-            'ETHUSDT': 4,   # ETH: до 0.0001
-            'SOLUSDT': 2,   # SOL: до 0.01
-            'XRPUSDT': 0,   # XRP: целые числа
-            'DOGEUSDT': 0,  # DOGE: целые числа
-            'ADAUSDT': 0,   # ADA: целые числа
-        }
-        
-        if pair in PRECISION_CACHE:
-            return PRECISION_CACHE[pair]
-        
-        # Для других пар пробуем получить от API
-        try:
-            response = self.client.get_instruments_info(
-                category="spot",
-                symbol=pair
-            )
-            
-            if response['retCode'] == 0 and response['result']['list']:
-                info = response['result']['list'][0]
-                base_precision = info.get('lotSizeFilter', {}).get('basePrecision', '0.01')
-                # Считаем количество знаков после запятой
-                if '.' in base_precision:
-                    decimals = len(base_precision.split('.')[1].rstrip('0'))
-                    return decimals
-                return 0
-        except Exception as e:
-            logger.debug(f"Не удалось получить precision для {pair}: {e}")
-        
-        # По умолчанию - 2 знака (безопаснее)
-        return 2
+        """Количество десятичных знаков для количества (из get_instruments_info)."""
+        return instrument_info.qty_decimals(pair)
 
 # Глобальный экземпляр
 trading_service = TradingService()
