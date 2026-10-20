@@ -120,25 +120,6 @@ class DatabaseConnection:
                 )
             """)
             
-            # 5. LLM Requests
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS llm_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pair TEXT NOT NULL,
-                    timeframe TEXT,
-                    prompt_type TEXT,
-                    score REAL,
-                    signal TEXT,
-                    summary TEXT,
-                    rejection_reason TEXT,
-                    cost_usd REAL DEFAULT 0,
-                    success INTEGER DEFAULT 1,
-                    error_code TEXT,
-                    error_message TEXT,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            
             # 6. Settings
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS settings (

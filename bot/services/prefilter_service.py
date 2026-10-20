@@ -1,6 +1,5 @@
 """
-Pre-filter сервис для технического анализа перед отправкой в AI
-Стратегия "Воронка": сначала Python фильтр, потом Perplexity
+Pre-filter сервис технического анализа (стратегия LEGACY)
 """
 from typing import List, Dict, Optional, Tuple
 from pybit.unified_trading import HTTP
@@ -11,10 +10,10 @@ from .indicators_service import technical_indicators
 
 class PreFilterService:
     """
-    Двухэтапный фильтр для экономии лимитов Perplexity:
+    Технический фильтр пар:
     
     Этап 1 (Python): Быстрый технический анализ
-    Этап 2 (AI): Только лучшие кандидаты отправляются в Perplexity
+    Этап 2: Лучшие кандидаты проходят технические вето (analysis_service)
     """
     
     # Критерии прохождения фильтра
@@ -31,7 +30,7 @@ class PreFilterService:
     
     def scan_and_filter(self, pairs: List[str], top_n: int = 2) -> List[Dict]:
         """
-        Сканировать пары и вернуть топ N кандидатов для AI анализа
+        Сканировать пары и вернуть топ N кандидатов
         
         Args:
             pairs: Список пар для проверки
@@ -64,7 +63,7 @@ class PreFilterService:
         top_candidates = candidates[:top_n]
         
         if top_candidates:
-            logger.info(f"🎯 Pre-filter: топ-{len(top_candidates)} кандидатов для AI:")
+            logger.info(f"🎯 Pre-filter: топ-{len(top_candidates)} кандидатов:")
             for c in top_candidates:
                 logger.info(f"   📊 {c['pair']}: score={c['score']:.0f} | RSI={c['analysis'].get('rsi', 'N/A')}")
         else:

@@ -49,7 +49,7 @@ PYRAMIDING_ADD_PERCENT = 0.35       # Размер докупки = 35% от р�
 DCA_ENABLED = False               # Включить докупку после пирамидинга (см. комментарий выше)
 DCA_TRIGGER_PERCENT = -0.015      # Докупка при просадке -1.5% (после пирамидинга)
 DCA_MAX_ENTRIES = 2               # Максимум 2 докупки на позицию
-DCA_MIN_SCORE = 50                # Минимальный AI score для докупки
+DCA_MIN_SCORE = 50                # Минимальный технический балл для докупки
 DCA_POSITION_MULTIPLIER = 0.5     # Размер докупки = 50% от позиции
 
 # ============= BREAKEVEN (безубыток) =============
@@ -68,7 +68,7 @@ STALE_MOVE_THRESHOLD = 0.005    # Позиция "мёртвая" если дв�
 
 # ============= ПАРАМЕТРЫ АНАЛИЗА =============
 
-# Пороги для сигналов
+# Пороги технического балла pre-filter (стратегия LEGACY и докупки)
 THRESHOLD_AUTO_TRADE = 70        # авто-вход только при score >= 70 (стратегия LEGACY)
 THRESHOLD_BUY = 60               # сигнал BUY при score >= 60
 THRESHOLD_WAIT = 50              # сигнал WAIT при 50 <= score < 60
@@ -76,9 +76,10 @@ THRESHOLD_WAIT = 50              # сигнал WAIT при 50 <= score < 60
 
 # ============= СТРАТЕГИЯ ВХОДА =============
 # "FUNNEL" — воронка: отбор ликвидных пар → тренд 4h → откат 1h → триггер 15m →
-#            поток ордеров / OI / funding → балльная оценка → AI только как вето →
+#            поток ордеров / OI / funding → балльная оценка →
 #            лимитный post-only вход, стоп за минимумом отката.
-# "LEGACY" — старая логика: pre-filter (RSI/EMA/MACD 1h) → AI score → рыночный вход.
+# "LEGACY" — старая логика: pre-filter (RSI/EMA/MACD/объём 1h) → тех. вето → рыночный вход.
+# ИИ (Perplexity / DeepSeek / Groq / Ollama) из бота удалён в v2.3.
 ENTRY_STRATEGY = "FUNNEL"
 
 # --- Шаг 1. Отбор пар (get_tickers spot + linear) ---
@@ -121,8 +122,6 @@ FUNNEL_LONG_RATIO_CROWDED = 0.70       # > 70% аккаунтов в лонге 
 
 # --- Шаг 5. Оценка, вето, исполнение ---
 FUNNEL_MIN_SCORE = 70                  # минимальный балл для входа (из 100)
-FUNNEL_AI_VETO_ENABLED = True          # AI может только запретить вход
-FUNNEL_AI_VETO_SCORE = 40              # AI score < 40 или сигнал AVOID — вето
 FUNNEL_STOP_BUFFER_ATR = 0.1           # стоп = минимум отката − 0.1×ATR(1h)
 FUNNEL_STOP_MIN_ATR = 0.5              # стоп не ближе 0.5×ATR(1h) (шум)
 FUNNEL_STOP_MAX_ATR = 2.5              # стоп дальше 2.5×ATR(1h) — сделку пропускаем
@@ -131,22 +130,6 @@ FUNNEL_LIMIT_TIMEOUT_SEC = 90          # сколько ждать исполн�
 FUNNEL_CORR_MAX = 0.8                  # корреляция 1h доходностей за 7 дней с открытой позицией
 FUNNEL_MAX_DEEP_CHECKS = 10            # макс. пар на глубокую проверку (стакан/OI) за цикл
 FUNNEL_LOG_SIGNALS = True              # писать баллы в таблицу entry_signals
-
-# ============= PERPLEXITY ЛИМИТЫ =============
-
-# Бюджет: 30$ в месяц
-MAX_LLM_COST_PER_MONTH = 30.0    # $ в месяц
-MAX_LLM_REQUESTS_PER_DAY = 100    # запросов в день
-
-# Интервал между анализами одной пары
-MIN_ANALYSIS_INTERVAL_PER_PAIR = 300  # секунд (5 минут)
-
-# Средняя стоимость запроса (для оценки)
-ESTIMATED_COST_PER_REQUEST = 0.02     # $
-
-# ============= LLM PROVIDER MODE =============
-# Режимы: PERPLEXITY_ONLY, GROQ_ONLY, LOCAL_ONLY, HYBRID, PREFER_LOCAL, PREFER_GROQ
-LLM_PROVIDER_MODE = "DEEPSEEK_ONLY"  # DeepSeek: дешёво, качественно, работает из РФ
 
 # ============= ТОРГОВЫЕ ПАРЫ ПО УМОЛЧАНИЮ =============
 

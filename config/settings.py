@@ -30,7 +30,7 @@ DB_PATH = BASE_DIR / "data" / "bot.db"
 # ============= РЕЖИМЫ БОТА =============
 class BotMode:
     ACTIVE = "ACTIVE"           # Нормальная работа
-    RISK_ONLY = "RISK_ONLY"     # Без ИИ
+    RISK_ONLY = "RISK_ONLY"     # Только сопровождение открытых позиций, без новых входов
     PAUSED = "PAUSED"           # На паузе
 
 # ============= НАСТРОЙКА ЛОГГЕРА =============

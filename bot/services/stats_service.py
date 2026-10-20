@@ -5,7 +5,6 @@ from typing import Dict, List
 from datetime import datetime, timedelta
 from config.settings import TIMEZONE
 from ..db.pnl_repo import PnLRepository
-from ..db.llm_requests_repo import LLMRequestsRepository
 from ..db.trades_repo import TradesRepository
 
 
@@ -14,7 +13,6 @@ class StatsService:
     
     def __init__(self):
         self.pnl_repo = PnLRepository()
-        self.llm_repo = LLMRequestsRepository()
         self.trades_repo = TradesRepository()
     
     def get_pnl_by_pairs_report(self, days: int = 7) -> str:
@@ -75,51 +73,6 @@ class StatsService:
             emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
             
             lines.append(f"{emoji} {date}: {pnl:+.2f} USDT ({trades} сделок)")
-        
-        return "\n".join(lines)
-    
-    def get_llm_stats_report(self, period: str = "week") -> str:
-        """
-        Отчёт по использованию Perplexity
-        
-        Args:
-            period: "today", "week", "month"
-        """
-        if period == "today":
-            stats = self.llm_repo.get_daily_stats()
-            title = "📊 ИИ-отчёт (сегодня)"
-        elif period == "week":
-            stats = self.llm_repo.get_period_stats(days=7)
-            title = "📊 ИИ-отчёт (неделя)"
-        else:  # month
-            stats = self.llm_repo.get_period_stats(days=30)
-            title = "📊 ИИ-отчёт (месяц)"
-        
-        total = stats['total_requests']
-        successful = stats['successful']
-        failed = stats['failed']
-        cost = stats['total_cost']
-        avg_cost = stats['avg_cost']
-        
-        success_rate = (successful / total * 100) if total > 0 else 0
-        
-        lines = [
-            title,
-            "",
-            f"🤖 Запросов к Perplexity: {total}",
-            f"✅ Успешных: {successful} ({success_rate:.1f}%)",
-            f"❌ Ошибок: {failed}",
-            f"💰 Суммарная стоимость: ${cost:.4f}",
-            f"💵 Средняя стоимость: ${avg_cost:.4f}"
-        ]
-        
-        # Месячный бюджет
-        if period in ["week", "month"]:
-            monthly_cost = self.llm_repo.get_monthly_cost()
-            from config.trading_config import MAX_LLM_COST_PER_MONTH
-            
-            budget_used = (monthly_cost / MAX_LLM_COST_PER_MONTH * 100)
-            lines.append(f"📊 Использовано бюджета: {budget_used:.1f}% (${monthly_cost:.2f} из ${MAX_LLM_COST_PER_MONTH})")
         
         return "\n".join(lines)
     

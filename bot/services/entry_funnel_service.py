@@ -256,26 +256,5 @@ class EntryFunnelService:
                 return True, f'корреляция с {other} = {corr:.2f} > {cfg.FUNNEL_CORR_MAX}'
         return False, ''
 
-    def funnel_summary(self, candidate: Dict) -> str:
-        """Короткое текстовое резюме для промпта AI."""
-        m = candidate['metrics']
-
-        def pct(x):
-            return f"{x*100:.2f}%" if isinstance(x, (int, float)) else 'n/a'
-
-        lines = [
-            f"Балл воронки: {candidate['score']}/100 ({', '.join(f'{k}={v}' for k, v in candidate['components'].items())})",
-            f"Тренд 4h: цена выше EMA50, наклон EMA50 {pct(m.get('ema50_slope'))}",
-            f"1h: RSI {m.get('rsi_1h', 0):.0f}, откат к EMA20/50: {'да' if m.get('pullback_ok') else 'нет'}, ATR {m.get('atr_1h', 0):.6g}",
-            f"Сила к BTC: 24ч {m.get('rs_24h', 0):+.2f} п.п., 7д {m.get('rs_7d', 0):+.2f} п.п.",
-            f"Триггер 15m: {m.get('trigger')}",
-            f"Стакан ±1%: биды/аски {m.get('book_imbalance') or 0:.2f}, стена асков: {'да' if m.get('ask_wall') else 'нет'}",
-            f"Агрессивные покупки за {cfg.FUNNEL_AGGRESSOR_WINDOW_MIN} мин: {pct(m.get('aggressor_share'))}",
-            f"OI за {cfg.FUNNEL_OI_HOURS}ч: {pct(m.get('oi_change'))} ({m.get('oi_label')}), funding {pct(m.get('funding_rate'))}",
-        ]
-        if candidate.get('notes'):
-            lines.append("Замечания: " + '; '.join(candidate['notes']))
-        return '\n'.join(lines)
-
 
 entry_funnel_service = EntryFunnelService()

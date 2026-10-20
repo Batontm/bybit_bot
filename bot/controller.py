@@ -19,8 +19,6 @@ from config.trading_config import (
     ARBITRAGE_RED_MIN_POSITION_SIZE_USD,
     MAX_SLIPPAGE_PERCENT,
     ENTRY_STRATEGY,
-    FUNNEL_AI_VETO_ENABLED,
-    FUNNEL_AI_VETO_SCORE,
 )
 from .db.connection import db
 from .services.analysis_service import analysis_service
@@ -36,7 +34,6 @@ from .services.entry_funnel_service import entry_funnel_service
 from .services.notification_dispatcher import NotificationDispatcher
 from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
-from .llm_router import llm_router
 
 
 BOT_VERSION = "v2.2.0"
@@ -123,11 +120,6 @@ class BotController:
     async def start(self):
         """Запустить контроллер и планировщик"""
         logger.info("🚀 Запуск контроллера...")
-        
-        # Проверка доступности LLM (любой из провайдеров: Groq / Perplexity / Ollama)
-        if not llm_router.has_any_provider():
-            logger.warning("⚠️ Ни один LLM-провайдер не доступен, режим RISK_ONLY")
-            self.mode = "RISK_ONLY"
         
         # Получаем настройки сканера из БД
         self._load_settings()
@@ -296,16 +288,16 @@ class BotController:
     
     async def _check_signals(self):
         """
-        Двухэтапная проверка сигналов (стратегия "Воронка"):
-        Этап 1: Python pre-filter (технический анализ)
-        Этап 2: AI анализ только для топ-2 кандидатов
+        Поиск сигналов на вход.
+        FUNNEL — воронка входа (_check_signals_funnel).
+        LEGACY — pre-filter (RSI/EMA/MACD/объём 1h) → технические вето → вход по рынку.
         """
         if self.mode == "PAUSED":
             logger.debug("⏸️ Бот на паузе, пропускаем проверку сигналов")
             return
         
         if self.mode == "RISK_ONLY":
-            logger.debug("🟡 Режим RISK_ONLY, новые сделки запрещены")
+            logger.debug("🟡 Режим RISK_ONLY (только сопровождение позиций), новые сделки запрещены")
             return
         
         if not self.auto_trading_enabled:
@@ -341,17 +333,14 @@ class BotController:
         candidates = prefilter_service.scan_and_filter(pairs_to_check, top_n=1)
         
         if not candidates:
-            logger.info("ℹ️ Pre-filter: нет подходящих кандидатов для AI")
+            logger.info("ℹ️ Pre-filter: нет подходящих кандидатов")
             return
         
-        # Этап 2: AI анализ (платно, Perplexity) - только для топ-2
-        logger.info(f"🤖 Этап 2: AI анализ {len(candidates)} кандидатов...")
-        
+        # Этап 2: технические вето (RSI, рост за 24ч, Bollinger, стакан) и порог балла
         for candidate in candidates:
             pair = candidate['pair']
             try:
-                # AI анализ (использует Perplexity)
-                analysis = await self.analysis_service.analyze_pair(pair, use_cache=True)
+                analysis = await self.analysis_service.analyze_pair(pair, score=candidate['score'])
                 
                 if not analysis:
                     continue
@@ -409,7 +398,7 @@ class BotController:
         """
         Воронка входа (ENTRY_STRATEGY = "FUNNEL"):
         отбор пар → тренд 4h → откат 1h → триггер 15m → поток ордеров/OI/funding →
-        балл >= FUNNEL_MIN_SCORE → корреляция → AI-вето → лимитный вход.
+        балл >= FUNNEL_MIN_SCORE → корреляция → лимитный вход.
         За цикл открывается не больше одной позиции.
         """
         open_positions = self.trading_service.trades_repo.get_open_positions()
@@ -437,22 +426,6 @@ class BotController:
                 logger.info(f"🔗 {pair}: пропуск — {why}")
                 repo.update(sid, decision='SKIP', reason=why)
                 continue
-
-            if FUNNEL_AI_VETO_ENABLED:
-                summary = entry_funnel_service.funnel_summary(c)
-                analysis = await self.analysis_service.analyze_pair(
-                    pair, use_cache=False, extra_context={'funnel_summary': summary}
-                )
-                if not analysis:
-                    repo.update(sid, decision='SKIP', reason='AI недоступен — вход без проверки не делаем')
-                    logger.warning(f"⚠️ {pair}: AI недоступен, пропуск")
-                    continue
-                ai_score, ai_signal = analysis.get('score', 0), analysis.get('signal', 'WAIT')
-                if ai_signal == 'AVOID' or ai_score < FUNNEL_AI_VETO_SCORE:
-                    why = f"AI вето: {ai_signal}, score={ai_score}. {analysis.get('summary', '')[:120]}"
-                    logger.info(f"🤖 {pair}: {why}")
-                    repo.update(sid, decision='AI_VETO', reason=why)
-                    continue
 
             position, err = await self.trading_service.open_position_with_plan(pair, c['plan'])
             if not position:
@@ -485,8 +458,6 @@ class BotController:
     def _log_rejection(self, pair: str, analysis: Dict, reason: str):
         """Записать причину отказа от входа в сделку для анализа"""
         try:
-            from .db.llm_requests_repo import LLMRequestsRepository
-            
             score = analysis.get('score', 0)
             signal = analysis.get('signal', 'UNKNOWN')
             summary = analysis.get('summary', '')
@@ -494,7 +465,7 @@ class BotController:
             # Формируем детальную причину
             rejection_text = f"Score {score}. {reason}"
             if summary:
-                rejection_text += f" | AI резюме: {summary[:100]}"
+                rejection_text += f" | {summary[:100]}"
             
             # Получаем последний request_id для этой пары и обновляем
             # Или просто логируем в файл для анализа
@@ -602,7 +573,7 @@ class BotController:
                     logger.info(f"📉 {action} триггер для {pair}, запрашиваем анализ...")
                     
                     # Запрашиваем свежий анализ
-                    analysis = await self.analysis_service.analyze_pair(pair, use_cache=False)
+                    analysis = await self.analysis_service.analyze_pair(pair)
                     
                     if analysis:
                         result = await self.trading_service.add_to_position(pos['id'], analysis)
@@ -636,12 +607,6 @@ class BotController:
         if self.mode == "PAUSED":
             self.mode = "ACTIVE"
             logger.info("▶️ Бот возобновлён после сброса дневных лимитов")
-        
-        # Проверяем доступность LLM-провайдеров
-        if self.mode == "RISK_ONLY":
-            if llm_router.has_any_provider():
-                self.mode = "ACTIVE"
-                logger.info("✅ LLM-провайдер доступен, переход в режим ACTIVE")
     
     async def _update_market_pairs(self):
         """Обновление списка пар через сканер (с сохранением на 24ч)"""

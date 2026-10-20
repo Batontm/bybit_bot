@@ -84,20 +84,6 @@ pkill -f 'python.*bot/main.py' || true
 nohup ./run_bot.sh > logs/run.log 2>&1 &
 ```
 
-### 2) `HTTP 401` по Perplexity
-Причина: нет `PERPLEXITY_API_KEY` в `/root/bybit_bot/.env`.
-
-Решение:
-```bash
-cd /root/bybit_bot
-nano .env
-# добавить:
-# PERPLEXITY_API_KEY=...
-
-pkill -f 'python.*bot/main.py' || true
-nohup ./run_bot.sh > logs/run.log 2>&1 &
-```
-
-### 3) `ErrCode: 170131 Insufficient balance` при закрытии
+### 2) `ErrCode: 170131 Insufficient balance` при закрытии
 Обычно означает, что монета заблокирована открытыми ордерами (TP/SL). Исправлено в коде: при закрытии сначала отменяются ордера.
 Если повторяется — нужно смотреть `orders` в БД и реальные открытые ордера на бирже.

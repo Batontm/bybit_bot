@@ -1,95 +1,67 @@
 """
-Сервис анализа рынка и работы с LLM (Perplexity / Ollama)
+Технический анализ пары (без ИИ): рыночные данные Bybit + индикаторы.
+
+Используется стратегией LEGACY (ENTRY_STRATEGY = "LEGACY") и для решения о
+докупке (DCA). Оценка score — технический балл pre-filter (RSI / EMA / MACD /
+объём), сигнал: BUY >= THRESHOLD_BUY, WAIT >= THRESHOLD_WAIT, иначе AVOID.
 """
 from typing import Dict, Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime
 from pybit.unified_trading import HTTP
 from config.settings import logger, TIMEZONE
-from config.api_config import BYBIT_TESTNET, get_pybit_kwargs
+from config.api_config import get_pybit_kwargs
 from config.trading_config import (
-    MIN_ANALYSIS_INTERVAL_PER_PAIR,
     THRESHOLD_AUTO_TRADE,
     THRESHOLD_BUY,
     THRESHOLD_WAIT
 )
-from ..llm_router import llm_router
-from ..db.llm_requests_repo import LLMRequestsRepository
 from ..error_tracker import error_tracker
-from .chart_service import chart_service
 from .indicators_service import technical_indicators
 
 
 class AnalysisService:
-    """Сервис анализа монет и рыночных данных"""
+    """Технический анализ монет и рыночные данные"""
     
     def __init__(self):
-        self.llm_repo = LLMRequestsRepository()
         self.bybit_client = HTTP(**get_pybit_kwargs())
     
-    async def analyze_pair(self, pair: str, timeframe: str = "1h", 
-                          use_cache: bool = True,
-                          extra_context: Optional[Dict] = None) -> Optional[Dict]:
+    async def analyze_pair(self, pair: str, score: Optional[float] = None) -> Optional[Dict]:
         """
-        Провести анализ торговой пары
-        
+        Технический анализ пары.
+
         Args:
             pair: Торговая пара
-            timeframe: Таймфрейм для анализа
-            use_cache: Использовать кэш если доступен
-            extra_context: Доп. данные для промпта (например, результаты воронки входа)
-        
+            score: Готовый балл (например, из pre-filter). Если не передан —
+                   используется общий технический балл индикаторов 1h.
+
         Returns:
-            Dict с анализом или None
+            Dict с рыночными данными, score и signal, или None
         """
-        # Проверяем кэш
-        if use_cache:
-            cached = self.llm_repo.get_latest_analysis(
-                pair, 
-                max_age_seconds=MIN_ANALYSIS_INTERVAL_PER_PAIR
-            )
-            
-            if cached:
-                logger.info(f"📦 Используем кэшированный анализ: {pair}")
-                result = {
-                    'pair': cached['pair'],
-                    'timeframe': cached['timeframe'],
-                    'score': cached['score'],
-                    'signal': cached['signal'],
-                    'summary': cached['summary'],
-                    'cached': True,
-                    'timestamp': cached['created_at']
-                }
-                # Свежие рыночные данные обязательны: без rsi/change_24h/bb_upper
-                # жёсткие VETO в should_enter_trade молча пропускались.
-                fresh = self.get_market_data(pair)
-                if not fresh:
-                    logger.warning(f"⚠️ {pair}: нет свежих рыночных данных для кэшированного анализа")
-                    return None
-                for k, v in fresh.items():
-                    result.setdefault(k, v)
-                return result
-        
-        # Получаем рыночные данные
         market_data = self.get_market_data(pair)
-        
         if not market_data:
             logger.error(f"❌ Не удалось получить данные для {pair}")
             return None
 
-        if extra_context:
-            market_data.update(extra_context)
-        
-        # Запрашиваем анализ у LLM Router (Perplexity / Ollama)
-        analysis = await llm_router.analyze_pair(pair, timeframe, market_data)
-        
-        if analysis:
-            for k, v in market_data.items():
-                analysis.setdefault(k, v)
-            analysis['pair'] = pair
-            analysis['timeframe'] = timeframe
-            analysis['cached'] = False
-            analysis['timestamp'] = datetime.now(TIMEZONE).isoformat()
-        
+        if score is None:
+            score = market_data.get('tech_score') or 0
+        score = int(round(score))
+
+        if score >= THRESHOLD_BUY:
+            signal = 'BUY'
+        elif score >= THRESHOLD_WAIT:
+            signal = 'WAIT'
+        else:
+            signal = 'AVOID'
+
+        analysis = dict(market_data)
+        analysis.update({
+            'pair': pair,
+            'score': score,
+            'signal': signal,
+            'summary': (f"RSI={market_data.get('rsi')}, EMA={market_data.get('ema_trend')}, "
+                        f"MACD={market_data.get('macd_signal')}"),
+            'timestamp': datetime.now(TIMEZONE).isoformat(),
+        })
         return analysis
     
     def get_market_data(self, pair: str) -> Optional[Dict]:
@@ -232,14 +204,6 @@ class AnalysisService:
             logger.error(f"❌ Ошибка анализа стакана {pair}: {e}")
             return True
 
-    async def get_analysis_chart(self, pair: str, analysis: Dict) -> Optional[bytes]:
-        """Получить изображение графика для анализа"""
-        klines = self.get_klines(pair, interval="60", limit=50) # 1h candles
-        if not klines:
-            return None
-            
-        return chart_service.generate_chart(pair, klines, analysis)
-
     def should_enter_trade(self, analysis: Dict) -> tuple[bool, str]:
         """
         Определить, стоит ли входить в сделку
@@ -253,7 +217,7 @@ class AnalysisService:
         score = analysis.get('score', 0)
         signal = analysis.get('signal', 'WAIT')
 
-        # Жёсткие veto (AI не может обойти): защита от покупок на хаях / FOMO
+        # Жёсткие veto: защита от покупок на хаях / FOMO
         rsi = analysis.get('rsi')
         if rsi is not None:
             try:
@@ -298,50 +262,6 @@ class AnalysisService:
         
         return False, f"Score недостаточен для авто-входа ({score} < {THRESHOLD_AUTO_TRADE})"
     
-    def format_analysis_message(self, analysis: Dict) -> str:
-        """Форматировать анализ для отправки в Telegram"""
-        if not analysis:
-            return "❌ Анализ недоступен"
-        
-        pair = analysis.get('pair', 'N/A')
-        score = analysis.get('score', 0)
-        signal = analysis.get('signal', 'WAIT')
-        summary = analysis.get('summary', 'Нет резюме')
-        cached = analysis.get('cached', False)
-        
-        # Эмодзи для сигнала
-        signal_emoji = {
-            'BUY': '🟢',
-            'WAIT': '🟡',
-            'AVOID': '🔴'
-        }
-        
-        # Рекомендация
-        if score >= THRESHOLD_AUTO_TRADE:
-            recommendation = "✅ Можно покупать (авто-вход разрешён)"
-        elif score >= THRESHOLD_BUY:
-            recommendation = "⚠️ Можно покупать (требуется подтверждение)"
-        elif score >= THRESHOLD_WAIT:
-            recommendation = "⏳ Лучше подождать"
-        else:
-            recommendation = "❌ Избегать сделки"
-        
-        cache_status = "📦 Из кэша" if cached else "🆕 Свежий анализ"
-        
-        message = f"""📊 Анализ {pair}
-
-{signal_emoji.get(signal, '⚪')} Сигнал: {signal}
-⭐ Score: {score}/100
-
-📝 Резюме:
-{summary}
-
-{recommendation}
-
-{cache_status}
-"""
-        
-        return message
 
 
 # Глобальный экземпляр

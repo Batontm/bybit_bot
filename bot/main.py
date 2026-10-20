@@ -158,27 +158,7 @@ class TradingBot:
         checks['bybit_ws'] = True
         logger.info("   ✅ WebSocket эндпоинты доступны")
         
-        # 5. LLM Provider (Groq / Perplexity / Ollama — любой)
-        logger.info("🤖 Проверка LLM провайдеров...")
-        from bot.llm_router import llm_router
-        status = llm_router.get_status()
-        logger.info(f"   Режим: {status['mode']}")
-        logger.info(f"   Perplexity: {'✅' if status['perplexity'] else '❌'}")
-        logger.info(f"   Groq:       {'✅' if status['groq'] else '❌'}")
-        logger.info(f"   Ollama:     {'✅' if status['ollama'] else '❌'}")
-
-        if llm_router.test_active_provider():
-            logger.info("   ✅ Хотя бы один LLM провайдер доступен")
-            checks['llm'] = True
-        else:
-            logger.warning("   ⚠️ Ни один LLM провайдер недоступен, режим RISK_ONLY")
-            checks['llm'] = False
-            checks['mode'] = 'RISK_ONLY'
-
-        # legacy ключ для обратной совместимости
-        checks['perplexity'] = status['perplexity']
-        
-        # 6. База данных
+        # 5. База данных
         logger.info("💾 Проверка базы данных...")
         try:
             from bot.db.connection import db
@@ -196,7 +176,7 @@ class TradingBot:
             error_tracker.add_error("Database", "ConnectionError", str(e))
             checks['database'] = False
         
-        # 7. Балансы
+        # 6. Балансы
         logger.info("💰 Получение балансов...")
         try:
             balances = balance_service.get_all_balances()
@@ -215,7 +195,7 @@ class TradingBot:
             logger.error(f"   ❌ Ошибка получения балансов: {e}")
             checks['balances'] = []
         
-        # 8. Итог
+        # 7. Итог
         logger.info("")
         logger.info("=" * 60)
         logger.info("📊 РЕЗУЛЬТАТЫ ПРОВЕРОК:")

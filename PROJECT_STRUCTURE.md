@@ -1,17 +1,16 @@
 # Bybit Trading Bot — Полная документация проекта
 
-> **Последнее обновление:** 2026-10-20 v2.2.0
+> **Последнее обновление:** 2026-10-20 v2.3.0
 
 ## 📋 Обзор
 
-Автоматизированный торговый бот для **спотовой торговли на Bybit** с AI-анализом через Perplexity, управлением через Telegram (aiogram) и спот-фьючерсным арбитражем.
+Автоматизированный торговый бот для **спотовой торговли на Bybit** с техническим анализом по данным биржи (без ИИ), управлением через Telegram (aiogram) и спот-фьючерсным арбитражем.
 
 | Параметр | Значение |
 |----------|----------|
 | **Язык** | Python 3.12+ |
 | **Биржа** | Bybit Demo Trading (спот + фьючерсы) |
 | **API URL** | `https://api-demo.bybit.com` |
-| **AI** | Perplexity API (модель Sonar) + Ollama (qwen2.5:1.5b) |
 | **Telegram** | aiogram 3.x (inline-кнопки, callback) |
 | **БД** | SQLite (`data/bot.db`) — WAL mode, thread-safe |
 | **Сервер** | 217.12.37.42:58291 (root, SSH alias: `bybit-bot`) |
@@ -21,11 +20,11 @@
 
 1. **Светофор (Market Regime)** — BTC 4H (закрытые свечи): если close > EMA200, RSI14 >= 40 и ATR не в панике (< 2× среднего ATR за 30 свечей) → ЗЕЛЕНЫЙ, иначе КРАСНЫЙ
 2. **Воронка входа (`ENTRY_STRATEGY = "FUNNEL"`, v2.2)** — отбор ликвидных пар → тренд 4h → откат 1h → триггер 15m → стакан / агрессор / OI / funding → балл 0–100 (вход от 70). Подробно — раздел «Воронка входа» ниже
-3. **AI как вето** — DeepSeek/Perplexity получает все цифры воронки и может только запретить вход (AVOID или score < 40)
+3. **Без ИИ** — решения принимаются только по данным Bybit; LLM-провайдеры (Perplexity, DeepSeek, Groq, Ollama) удалены в v2.3
 4. **Исполнение** — лимитный post-only ордер по лучшему биду (90 с, иначе отмена); позиция пишется по фактической цене и количеству; стоп за минимумом отката, тейк 2.5R, риск ровно 0.5% депозита
 5. **Корреляция** — не открываем вторую позицию в паре, коррелирующей с уже открытой (> 0.8 за 7 дней)
 6. **Защита позиций** — TP/SL ордера, Trailing Stop, Breakeven, Time Exit
-7. **Старая логика (`ENTRY_STRATEGY = "LEGACY"`)** — pre-filter RSI/EMA/MACD → AI score ≥ 70 → рыночный вход (оставлена для сравнения)
+7. **Старая логика (`ENTRY_STRATEGY = "LEGACY"`)** — pre-filter RSI/EMA/MACD/объём → технические вето (RSI > 70, рост > 5%, верхняя BB, стена в стакане) → балл ≥ 70 → рыночный вход (оставлена для сравнения)
 8. **Пирамидинг / Smart DCA** — по умолчанию выключены (до v2.2 фактически не работали); при включении объём TP/SL пересчитывается после докупки
 9. **Auto-SL** — автоматическое создание SL для незащищённых позиций
 10. **Спот-Фьючерс Арбитраж** — авто-funding через SHORT фьючерсов (только BTC/ETH — collateral whitelist)
@@ -47,14 +46,11 @@ bybit_bot/
 ├── bot/                              # Основная логика бота
 │   ├── main.py                       # Точка входа, стартовые проверки
 │   ├── controller.py                 # Планировщик задач (APScheduler), главный цикл
-│   ├── perplexity_client.py          # AI-анализ через Perplexity (sonar)
-│   ├── ollama_client.py              # AI-анализ через Ollama (qwen2.5:1.5b, локально)
-│   ├── llm_router.py                 # Маршрутизатор LLM провайдеров
 │   ├── error_tracker.py              # Кольцевой буфер ошибок (deque, 200 записей)
 │   │
 │   ├── services/                     # Бизнес-логика (singleton через глобальные экземпляры)
 │   │   ├── market_regime_service.py  # "Светофор" — BTC 4H: EMA200 + RSI14 + ATR spike filter
-│   │   ├── analysis_service.py       # AI-анализ пар + кэширование
+│   │   ├── analysis_service.py       # Технический анализ пары + вето (LEGACY, DCA)
 │   │   ├── trading_service.py        # Открытие позиций, TP/SL, DCA, пирамидинг
 │   │   ├── position_service.py       # Закрытие, Trailing, Breakeven, Auto-SL, Time Exit, Reconcile, Dust
 │   │   ├── balance_service.py        # Балансы USDT и монет (UNIFIED account)
@@ -62,7 +58,7 @@ bybit_bot/
 │   │   ├── indicators_service.py     # Индикаторы: RSI, EMA, MACD, ATR, Bollinger Bands
 │   │   ├── scanner_service.py        # Сканер Top Gainers (mainnet данные)
 │   │   ├── arbitrage_service.py      # Спот-Фьючерс арбитраж (funding rates, collateral whitelist)
-│   │   ├── stats_service.py          # Статистика: PnL по дням/парам, LLM-отчёты
+│   │   ├── stats_service.py          # Статистика: PnL по дням/парам
 │   │   ├── chart_service.py          # Генерация PNG-графиков (matplotlib)
 │   │   └── websocket_service.py      # Цены реалтайм (pybit WebSocket + REST fallback)
 │   │
@@ -71,7 +67,6 @@ bybit_bot/
 │   │   ├── trades_repo.py            # CRUD: позиции, ордера, сделки
 │   │   ├── pnl_repo.py              # PnL по дням и парам
 │   │   ├── daily_pnl_repo.py        # Дневной PnL (upsert по date_utc)
-│   │   ├── llm_requests_repo.py     # Логи запросов к Perplexity/Ollama
 │   │   └── arbitrage_repo.py        # Арбитражные позиции
 │   │
 │   ├── telegram_aiogram/            # Telegram интерфейс (АКТИВНЫЙ, aiogram 3.x)
@@ -121,7 +116,7 @@ bybit_bot/
 | 4f. Делистинг | анонсы Bybit (если метод есть в pybit) | монета в анонсе о делистинге за 30 дней — **вето** | — |
 
 Вход: балл ≥ 70, нет вето, план сделки валиден (стоп = минимум отката − 0.1 ATR, не ближе 0.5 ATR,
-не дальше 2.5 ATR), нет корреляции > 0.8 с открытыми позициями, AI не наложил вето.
+не дальше 2.5 ATR), нет корреляции > 0.8 с открытыми позициями.
 За один цикл (10 мин) открывается не больше одной позиции.
 
 Анализ результатов на демо:
@@ -143,11 +138,10 @@ ORDER BY s.id DESC;
 2. Проверка Bybit REST API (get_server_time)
 3. Тестовый ордер (Limit Buy BTC → Cancel) — проверка торговых прав
 4. Проверка WebSocket эндпоинтов
-5. Проверка Perplexity API
-6. Проверка БД (количество таблиц)
-7. Получение балансов
-8. Запуск Telegram бота (aiogram)
-9. Запуск контроллера (APScheduler)
+5. Проверка БД (количество таблиц)
+6. Получение балансов
+7. Запуск Telegram бота (aiogram)
+8. Запуск контроллера (APScheduler)
 
 ### `controller.py` — BotController (планировщик)
 
@@ -186,9 +180,9 @@ ORDER BY s.id DESC;
 1. Проверка режима (не PAUSED, auto_trading включён)
 2. **Светофор**: `market_regime_service.is_trading_allowed()` — КРАСНЫЙ → пропуск
 3. Сбор пар (fixed + dynamic), исключение пар с открытыми позициями и забаненных
-4. **Pre-filter**: `prefilter_service.scan_and_filter(pairs, top_n=2)`
-5. AI-анализ каждого кандидата через Perplexity
-6. `should_enter_trade(analysis)` — score >= 80
+4. `ENTRY_STRATEGY == "FUNNEL"` → `_check_signals_funnel()` (см. «Воронка входа»), иначе:
+5. **Pre-filter**: `prefilter_service.scan_and_filter(pairs, top_n=1)`
+6. `analysis_service.analyze_pair(pair, score)` + `should_enter_trade(analysis)` — технические вето, score >= 70
 7. `check_risk_limits()` — лимиты позиций, дневной лосс
 8. `trading_service.open_position(pair, analysis)` → TP/SL ордера
 9. Проверка slippage → бан пары при 3+ превышениях
@@ -254,20 +248,20 @@ ORDER BY s.id DESC;
 | `open_position(pair, analysis)` | Возвращает `(position, error_message)` |
 | `add_to_position(id, analysis)` | Smart DCA — докупка |
 | `check_risk_limits()` | Макс. позиций, дневной лосс, макс. пар |
-| `should_enter_trade(analysis)` | Score >= 80 + тренд OK |
-| `_calculate_position_size()` | risk% * deposit / SL_distance * (score/80) |
+| `open_position_with_plan(pair, plan)` | Вход по плану воронки (post-only лимитка) |
+| `get_add_action(position)` | Нужна ли докупка: PYRAMIDING / DCA / None |
 
 **Логика `open_position()`:**
 1. Тренд-фильтр (EMA20 > EMA50)
 2. ATR-based TP/SL (или фиксированные fallback)
 3. Position sizing: `MAX_RISK_PER_TRADE * deposit / SL_distance`
-4. Корректировка по AI score: `size * (score / 80)`, 0.5x–1.2x
+4. Корректировка по техническому баллу: `size * (score / 80)`, 0.5x–1.0x
 5. Пирамидинг: первый вход = 65%
 6. Market Buy → TP/SL ордера → возврат `(position, None)` или `(None, "ошибка")`
 
 ### `prefilter_service.py` — Технический фильтр
 
-**Стратегия "Воронка":** Python фильтр → Perplexity (только лучшие).
+**Стратегия LEGACY:** технический фильтр → технические вето → вход.
 
 Критерии: RSI 25–70, Volume >= 1.2x среднего.
 
@@ -306,20 +300,10 @@ Scoring (0–100): RSI 30–45: +20 | EMA BULLISH: +15 | MACD BULLISH: +10 | Vol
 
 **Красный режим:** макс. 8 позиций, 30% от стейблов, мин. $50/позиция.
 
-### `llm_router.py` — Маршрутизатор AI
-
-| Режим | Описание |
-|-------|----------|
-| `PERPLEXITY_ONLY` | Только Perplexity (текущий) |
-| `LOCAL_ONLY` | Только Ollama |
-| `HYBRID` | Perplexity → Ollama fallback |
-| `PREFER_LOCAL` | Ollama → Perplexity fallback |
-
 ### `stats_service.py` — Статистика
 
 - `get_pnl_by_pairs_report(days)` — PnL по парам (топ-10)
 - `get_pnl_by_days_report(days)` — PnL по дням
-- `get_llm_stats_report(period)` — Perplexity: запросы, стоимость, бюджет
 - `get_positions_status_report()` — Текущие открытые позиции
 
 ### `chart_service.py` — Графики
@@ -394,7 +378,6 @@ PNG-графики: свечи + TP/SL уровни + стрелки BUY/SELL (m
 | `trades` | Исполненные сделки |
 | `pnl_history` | История PnL по дням/парам |
 | `daily_pnl` | Дневной PnL (gross, net, commission, slippage) |
-| `llm_requests` | Логи запросов к Perplexity/Ollama |
 | `settings` | Настройки бота (key-value) |
 | `arbitrage_positions` | Арбитражные позиции |
 | `entry_signals` | Воронка входа: шаг, балл, компоненты, метрики, решение, `position_id` (v2.2) |
@@ -544,15 +527,12 @@ LONG только если EMA20 > EMA50 (`TREND_FILTER_ENABLED = True`)
 | `ARBITRAGE_RED_TOTAL_ALLOCATION_PCT` | 30% |
 | `ARBITRAGE_RED_MIN_POSITION_SIZE_USD` | $50 |
 
-#### Perplexity AI
+#### Пороги технического балла (LEGACY / DCA)
 
 | Параметр | Значение |
 |----------|----------|
-| `MAX_LLM_COST_PER_MONTH` | $30 |
-| `MAX_LLM_REQUESTS_PER_DAY` | 100 |
-| `LLM_PROVIDER_MODE` | PERPLEXITY_ONLY |
-| `THRESHOLD_AUTO_TRADE` | 80 |
-| `THRESHOLD_BUY` | 70 |
+| `THRESHOLD_AUTO_TRADE` | 70 |
+| `THRESHOLD_BUY` | 60 |
 | `THRESHOLD_WAIT` | 50 |
 
 ---
@@ -577,8 +557,8 @@ _check_signals() [каждые 10 мин]
 │  └─ RSI 25-70, Volume >= 1.2x, EMA, MACD → Score → топ-2
 │
 ├─ Для каждого кандидата:
-│  ├─ AI: analyze_pair() → score, signal, target, SL
-│  ├─ score >= 80? → ДА
+│  ├─ analyze_pair() → технические вето (RSI, рост 24ч, BB, стакан)
+│  ├─ score >= 70? → ДА
 │  ├─ risk_limits OK? → ДА
 │  ├─ open_position() → Market Buy + TP/SL
 │  └─ Telegram уведомление
@@ -643,8 +623,6 @@ Host bybit-bot
 | Bybit REST (Demo) | Балансы, ордера | `https://api-demo.bybit.com/v5/*` |
 | Bybit WS Public | Тикеры реалтайм | `wss://stream.bybit.com/v5/public/spot` |
 | Bybit WS Private | Приватные данные | `wss://stream-demo.bybit.com/v5/private` |
-| Perplexity | AI-анализ | `https://api.perplexity.ai/chat/completions` |
-| Ollama | Локальная LLM | `http://localhost:11434/api/generate` |
 | Telegram | Интерфейс | Bot API (aiogram 3.x) |
 
 ---
@@ -656,9 +634,6 @@ Host bybit-bot
 BYBIT_API_KEY=...
 BYBIT_API_SECRET=...
 BYBIT_BASE_URL=https://api-demo.bybit.com
-
-# Perplexity
-PERPLEXITY_API_KEY=...
 
 # Telegram
 TELEGRAM_BOT_TOKEN=...
@@ -680,7 +655,6 @@ TELEGRAM_ALLOWED_USER_IDS=6784568
 
 - [ ] Реализовать `reconcile_orphan_orders()` в `PositionService`
 - [ ] Добавить веб-дашборд (FastAPI + React)
-- [ ] Улучшить AI промпт (добавить on-chain данные)
 - [ ] Добавить поддержку mainnet (реальная торговля)
 - [ ] Мониторинг здоровья бота (uptime, heartbeat)
 - [ ] Бэкап БД (автоматический)
@@ -688,6 +662,15 @@ TELEGRAM_ALLOWED_USER_IDS=6784568
 ---
 
 ## ✅ История версий
+
+### v2.3.0 (2026-10-20)
+- ✅ ИИ полностью удалён: LLM-клиенты (Perplexity, DeepSeek, Groq, Ollama), роутер, промпты, кэш запросов `llm_requests`
+- ✅ Бот больше не уходит в RISK_ONLY из-за недоступных API-ключей ИИ
+- ✅ LEGACY и DCA используют технический балл вместо AI score
+
+### v2.2.0 (2026-10-20)
+- ✅ Воронка входа по данным Bybit (`ENTRY_STRATEGY = "FUNNEL"`), лог `entry_signals`
+- ✅ Исправлены: time exit, ATR-фильтр светофора, незакрытые свечи, суммарный риск, цена входа по исполнению, точность цен
 
 ### v2.0.0 (2026-02-09)
 - ✅ Переход на Demo Trading (api-demo.bybit.com) вместо testnet

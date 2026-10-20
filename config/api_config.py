@@ -1,5 +1,5 @@
 """
-Конфигурация API ключей и эндпоинтов для Bybit и Perplexity
+Конфигурация API ключей и эндпоинтов для Bybit и Telegram
 """
 import os
 from dotenv import load_dotenv
@@ -56,33 +56,6 @@ BYBIT_ENDPOINTS = {
     "instruments": "/v5/market/instruments-info",
 }
 
-# ============= PERPLEXITY API =============
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "")
-PERPLEXITY_BASE_URL = "https://api.perplexity.ai"
-# Актуальные модели: sonar, sonar-pro, sonar-reasoning
-PERPLEXITY_MODEL = "sonar"
-
-# ============= GROQ API (быстрый бесплатный LLM на LPU) =============
-# Получить ключ: https://console.groq.com/keys
-# ВНИМАНИЕ: Groq блокирует запросы из РФ/IR/KP/SY/CU/VE
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-# Модели: llama-3.3-70b-versatile (качество), llama-3.1-8b-instant (скорость),
-# deepseek-r1-distill-llama-70b (reasoning)
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-# ============= DEEPSEEK API (китайский, очень дешёвый, работает из РФ) =============
-# Получить ключ: https://platform.deepseek.com (раздел "API Keys")
-# Цены: deepseek-chat $0.14/1M вход + $0.28/1M выход (~$1 = 3-5k анализов)
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-# Модели: deepseek-chat (V3, быстрый), deepseek-reasoner (R1, reasoning)
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-
-# ============= OLLAMA (локальная LLM) =============
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
-
 # ============= TELEGRAM API =============
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -104,9 +77,6 @@ def validate_config():
         errors.append("TELEGRAM_BOT_TOKEN не установлен")
     if not TELEGRAM_CHAT_ID:
         errors.append("TELEGRAM_CHAT_ID не установлен")
-    
-    if not PERPLEXITY_API_KEY:
-        errors.append("⚠️  PERPLEXITY_API_KEY не установлен (бот будет в режиме RISK_ONLY)")
     
     return errors
 

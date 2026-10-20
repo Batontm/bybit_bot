@@ -93,7 +93,6 @@ def test_scan_finds_candidate_with_plan():
     assert c['pair'] == 'XUSDT' and c['score'] >= 70
     assert c['plan'].stop < c['plan'].entry < c['plan'].take_profit
     assert c['signal_id']
-    assert 'Балл воронки' in svc.funnel_summary(c)
 
 
 def test_scan_skips_when_funding_overheated():
@@ -191,7 +190,7 @@ async def test_open_with_plan_not_filled_cancels(monkeypatch):
     assert all(kw['side'] == 'Buy' for _, kw in client.orders)  # никаких TP/SL
 
 
-async def _run_controller(monkeypatch, ai_result):
+async def _run_controller(monkeypatch, strategy='FUNNEL'):
     from bot import controller as ctrl_module
     from bot.services.entry_funnel_service import entry_funnel_service
 
@@ -201,32 +200,46 @@ async def _run_controller(monkeypatch, ai_result):
     monkeypatch.setattr(entry_funnel_service, 'client', FakeMarket())
     monkeypatch.setattr(entry_funnel_service, '_kline_cache', {})
     monkeypatch.setattr(ctrl_module.market_regime_service, 'is_trading_allowed', lambda: (True, 'ok'))
+    monkeypatch.setattr(ctrl_module, 'ENTRY_STRATEGY', strategy)
 
     ctrl = ctrl_module.BotController()
     ctrl.trading_service = trading
     ctrl.fixed_pairs = []
-    sent = []
+    sent, analyzed = [], []
 
     async def fake_notify(msg):
         sent.append(msg)
 
-    async def fake_analyze(pair, timeframe='1h', use_cache=True, extra_context=None):
-        assert extra_context and 'Балл воронки' in extra_context['funnel_summary']
-        return dict(ai_result, pair=pair)
+    async def fake_analyze(pair, score=None):
+        analyzed.append(pair)
+        return None
 
     monkeypatch.setattr(ctrl, '_send_notification', fake_notify)
     monkeypatch.setattr(ctrl.analysis_service, 'analyze_pair', fake_analyze)
     monkeypatch.setattr(ctrl, '_is_pair_banned', lambda p: False)
     await ctrl._check_signals()
-    return client, sent
+    return client, sent, analyzed
 
 
-async def test_controller_funnel_opens_position(monkeypatch):
-    client, sent = await _run_controller(monkeypatch, {'score': 70, 'signal': 'BUY', 'summary': 'ok'})
+async def test_controller_funnel_opens_position_without_ai(monkeypatch):
+    client, sent, analyzed = await _run_controller(monkeypatch)
     assert any(kw['side'] == 'Buy' for _, kw in client.orders)
     assert sent and 'Балл воронки' in sent[0]
+    assert analyzed == []  # воронка не зовёт никакой внешний анализ
 
 
-async def test_controller_funnel_ai_veto_blocks(monkeypatch):
-    client, sent = await _run_controller(monkeypatch, {'score': 20, 'signal': 'AVOID', 'summary': 'делистинг'})
-    assert client.orders == [] and sent == []
+def test_no_ai_modules_left():
+    import importlib
+    for name in ('bot.llm_router', 'bot.llm.prompts', 'bot.perplexity_client', 'bot.db.llm_requests_repo'):
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError:
+            continue
+        raise AssertionError(f'{name} всё ещё в проекте')
+
+
+def test_controller_starts_active_without_ai(monkeypatch):
+    from bot import controller as ctrl_module
+    ctrl = ctrl_module.BotController()
+    assert ctrl.mode == 'ACTIVE'
+    assert not hasattr(ctrl_module, 'llm_router')

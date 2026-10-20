@@ -120,3 +120,17 @@ def test_regime_calm_market_allowed():
     st = svc._compute_status(datetime.now())
     assert st.atr_ratio == pytest.approx(1.0, abs=0.1)
     assert st.allowed, st.reason
+
+
+# ----------------------------------------------------------------- технический анализ (без ИИ)
+
+async def test_analysis_service_technical_signal(monkeypatch):
+    from bot.services.analysis_service import AnalysisService
+    svc = AnalysisService.__new__(AnalysisService)
+    monkeypatch.setattr(svc, 'get_market_data', lambda pair: {'price': 1.0, 'rsi': 45, 'tech_score': 55})
+    a = await svc.analyze_pair('XUSDT')
+    assert a['score'] == 55 and a['signal'] == 'WAIT'
+    a = await svc.analyze_pair('XUSDT', score=75)
+    assert a['score'] == 75 and a['signal'] == 'BUY'
+    a = await svc.analyze_pair('XUSDT', score=30)
+    assert a['signal'] == 'AVOID'

@@ -133,31 +133,6 @@ def create_tables(conn):
         CREATE INDEX IF NOT EXISTS idx_pnl_date ON pnl_history(date)
     """)
     
-    # ========== ТАБЛИЦА: llm_requests ==========
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS llm_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pair TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
-            prompt_type TEXT NOT NULL,
-            score INTEGER,
-            signal TEXT,
-            summary TEXT,
-            cost_usd REAL DEFAULT 0,
-            success BOOLEAN NOT NULL DEFAULT 1,
-            error_code TEXT,
-            error_message TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_llm_pair ON llm_requests(pair)
-    """)
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_llm_created ON llm_requests(created_at)
-    """)
-    
     # ========== ТАБЛИЦА: market_data (опционально) ==========
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS market_data (

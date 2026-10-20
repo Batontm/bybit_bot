@@ -272,13 +272,13 @@ class TradingService:
             position_size = position_size * INITIAL_POSITION_PERCENT
             logger.info(f"📊 Пирамидинг: {INITIAL_POSITION_PERCENT*100:.0f}% от полного размера")
         
-        # POSITION SIZING по AI SCORE: слабый сигнал — меньше позиция.
+        # POSITION SIZING по техническому баллу: слабый сигнал — меньше позиция.
         # Множитель ограничен 1.0: раньше при score > 80 он доходил до 1.2 и риск
         # сделки превышал MAX_RISK_PER_TRADE.
-        ai_score = analysis.get('score', 70)
-        score_multiplier = max(0.5, min(1.0, ai_score / 80))
+        score = analysis.get('score', 70)
+        score_multiplier = max(0.5, min(1.0, score / 80))
         position_size = position_size * score_multiplier
-        logger.info(f"📊 AI Score sizing: score={ai_score}, multiplier={score_multiplier:.2f}")
+        logger.info(f"📊 Score sizing: score={score}, multiplier={score_multiplier:.2f}")
         
         return await self._execute_entry(
             pair, position_size, current_price, tp_price, sl_price, limit_price=None
