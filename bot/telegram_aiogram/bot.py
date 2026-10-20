@@ -19,6 +19,16 @@ from .handlers import create_router
 MAX_MESSAGES_PER_MINUTE = 20
 
 
+def telegram_configured(token: Optional[str], chat_id: Optional[str]) -> bool:
+    """Токен вида '123456:ABC...' и chat_id заданы (не заглушки из .env.example)."""
+    if not token or not chat_id:
+        return False
+    if token.startswith('your_') or str(chat_id).startswith('your_'):
+        return False
+    head, _, tail = token.partition(':')
+    return head.isdigit() and len(tail) >= 20
+
+
 class AiogramTelegramBot:
     def __init__(self, controller=None):
         self.token = TELEGRAM_BOT_TOKEN
@@ -29,12 +39,25 @@ class AiogramTelegramBot:
         self.dp: Optional[Dispatcher] = None
         self._polling_task: Optional[asyncio.Task] = None
         self._msg_timestamps: deque = deque()
+        # Без Telegram бот работает дальше, а уведомления пишутся в лог
+        # (удобно для локальной проверки на компьютере).
+        self.enabled = telegram_configured(self.token, self.chat_id)
 
     async def start(self) -> None:
-        self.bot = Bot(
-            token=self.token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        )
+        if not self.enabled:
+            logger.warning("⚠️ Telegram не настроен (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — "
+                           "бот работает без Telegram, уведомления пишутся в лог")
+            return
+        try:
+            self.bot = Bot(
+                token=self.token,
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            )
+        except Exception as e:
+            logger.error(f"❌ Telegram: неверный токен ({e}) — работаю без Telegram")
+            self.enabled = False
+            self.bot = None
+            return
         self.dp = Dispatcher()
         self.dp.include_router(create_router(self.controller))
 
@@ -56,6 +79,7 @@ class AiogramTelegramBot:
 
     async def send_message(self, text: str, reply_markup=None) -> None:
         if not self.bot:
+            logger.info(f"📣 [уведомление] {text}")
             return
         if not self.chat_id:
             logger.error("❌ TELEGRAM_CHAT_ID не установлен")

@@ -1,0 +1,15 @@
+# Зависимости бота (Python 3.10+)
+pybit>=5.8,<6
+aiogram>=3.4,<4
+APScheduler>=3.10,<4
+python-dotenv>=1.0
+pytz>=2024.1
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+requests>=2.31
+certifi>=2024.2
+
+# Для тестов
+pytest>=7.4
+pytest-asyncio>=0.21

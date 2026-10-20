@@ -1,4 +1,27 @@
-# Деплой bybit_bot на сервер
+# Деплой bybit_bot
+
+## Локальный запуск на компьютере (macOS / Linux)
+
+Нужен Python 3.10+.
+
+```bash
+cd ~/Documents/bybit_bot
+./setup_local.sh      # один раз: .venv, зависимости, проверка ключей, тесты
+./run_bot.sh          # запуск; остановка — Ctrl+C или ./stop_bot.sh
+```
+
+- Ключи Bybit — в `.env` (`BYBIT_API_KEY`, `BYBIT_API_SECRET`, `BYBIT_BASE_URL`).
+  Проверка: `.venv/bin/python scripts/check_api_keys.py`.
+- Telegram не обязателен: без `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` бот работает,
+  а уведомления пишет в лог с пометкой `📣 [уведомление]`.
+- Лог: `logs/bot.log` (смотреть вживую: `tail -f logs/bot.log`), база: `data/bot.db`.
+- Тесты пишут в отдельную временную БД, рабочую `data/bot.db` не трогают.
+- Компьютер не должен засыпать: бот работает, пока открыт Терминал
+  (на Mac можно запускать как `caffeinate -i ./run_bot.sh`).
+
+## Сервер
+
+> Старый сервер `217.12.37.42` больше не существует. Раздел ниже — для будущего сервера.
 
 ## Параметры
 - Сервер: `root@217.12.37.42:58291`

@@ -3,7 +3,7 @@
 echo "🛑 Остановка Bybit Trading Bot"
 
 # Ищем процесс бота
-PID=$(ps aux | grep "bot/main.py" | grep -v grep | awk '{print $2}')
+PID=$(ps aux | grep -E "bot/main.py|-m bot.main" | grep -v grep | awk '{print $2}')
 
 if [ -z "$PID" ]; then
     echo "❌ Бот не запущен"

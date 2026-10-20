@@ -25,7 +25,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = BASE_DIR / "logs" / "bot.log"
 
 # База данных
-DB_PATH = BASE_DIR / "data" / "bot.db"
+DB_PATH = Path(os.getenv("BOT_DB_PATH") or (BASE_DIR / "data" / "bot.db"))
 
 # ============= РЕЖИМЫ БОТА =============
 class BotMode:

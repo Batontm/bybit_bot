@@ -1,26 +1,34 @@
 #!/bin/bash
+# Запуск бота локально: ./run_bot.sh  (остановка — Ctrl+C или ./stop_bot.sh)
+cd "$(dirname "$0")"
 
 echo "🤖 Запуск Bybit Trading Bot"
 echo "============================"
 
-# Активируем виртуальное окружение
-if [ -d "venv" ]; then
+# Виртуальное окружение: .venv (setup_local.sh) или старое venv
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+elif [ -d "venv" ]; then
     source venv/bin/activate
-    echo "✅ Виртуальное окружение активировано"
 else
-    echo "❌ Виртуальное окружение не найдено"
-    echo "Запустите сначала: python -m venv venv"
+    echo "❌ Виртуальное окружение не найдено. Сначала запусти: ./setup_local.sh"
     exit 1
 fi
+echo "✅ Виртуальное окружение активировано"
 
-# Проверяем наличие .env
 if [ ! -f ".env" ]; then
-    echo "❌ Файл .env не найден"
-    echo "Скопируйте .env.example в .env и заполните ключи"
+    echo "❌ Файл .env не найден. Скопируй .env.example в .env и впиши ключи"
     exit 1
 fi
 
-# Запускаем бота
+# Python с python.org на macOS не видит системные сертификаты —
+# берём набор certifi (иначе WebSocket/HTTPS падают с CERTIFICATE_VERIFY_FAILED)
+CERT=$(python -c 'import certifi; print(certifi.where())' 2>/dev/null)
+if [ -n "$CERT" ]; then
+    export SSL_CERT_FILE="$CERT"
+fi
+
+mkdir -p data logs
 echo ""
-echo "🚀 Запуск бота..."
-python bot/main.py
+echo "🚀 Запуск бота... (лог: logs/bot.log)"
+exec python -m bot.main
