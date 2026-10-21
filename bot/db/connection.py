@@ -211,6 +211,12 @@ class DatabaseConnection:
         _add_column("positions", "gross_pnl", "gross_pnl REAL DEFAULT 0")
         _add_column("positions", "net_pnl", "net_pnl REAL DEFAULT 0")
         _add_column("positions", "pyramiding_count", "pyramiding_count INTEGER DEFAULT 0")
+        # выходы в R (v2.5)
+        _add_column("positions", "initial_sl", "initial_sl REAL")
+        _add_column("positions", "entry_atr", "entry_atr REAL")
+        _add_column("positions", "tp1_price", "tp1_price REAL")
+        _add_column("positions", "partial_taken", "partial_taken INTEGER DEFAULT 0")
+        _add_column("positions", "partial_pnl", "partial_pnl REAL DEFAULT 0")
 
         conn.commit()
     

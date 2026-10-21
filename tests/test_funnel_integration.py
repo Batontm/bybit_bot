@@ -64,7 +64,8 @@ class FakeMarket:
             return self._ok({'list': _rows(self.btc4h, 14_400_000)})
         data = {'240': (self.c4h, 14_400_000), '60': (self.c1h, 3_600_000), '15': (self.c15, 900_000)}
         closes, step = data[interval]
-        return self._ok({'list': _rows(closes, step)})
+        # 1h свечи пошире: стоп за откатом должен быть дальше комиссий (фильтр ≤25% риска)
+        return self._ok({'list': _rows(closes, step, spread=0.012 if interval == '60' else 0.004)})
 
     def get_orderbook(self, category, symbol, limit):
         p = self.price
@@ -171,12 +172,16 @@ async def test_open_with_plan_limit_post_only(monkeypatch):
     buy = client.orders[0][1]
     assert buy['orderType'] == 'Limit' and buy['timeInForce'] == 'PostOnly'
     # риск ≈ 0.5% депозита
-    risk = (pos['entry_price'] - pos['sl_price']) * pos['quantity']
-    assert risk == pytest.approx(50.0, rel=0.02)
+    from bot.services.exit_rules import cost_per_unit
+    risk = (pos['entry_price'] - pos['sl_price'] + cost_per_unit(pos['entry_price'])) * pos['quantity']
+    assert risk == pytest.approx(50.0, rel=0.02)          # 0.5% капитала ВКЛЮЧАЯ комиссии
+    # тейки: TP1 на половину позиции + TP2
+    tps = [kw for _, kw in client.orders if kw['side'] == 'Sell' and kw['orderType'] == 'Limit']
+    assert len(tps) == 2 and float(tps[0]['price']) < float(tps[1]['price'])
     # количество за вычетом комиссии в монете, TP/SL поставлены
     assert pos['quantity'] < float(buy['qty'])
     sells = [kw for _, kw in client.orders if kw['side'] == 'Sell']
-    assert len(sells) == 2
+    assert len(sells) == 3                                  # TP1, TP2, SL
 
 
 async def test_open_with_plan_not_filled_cancels(monkeypatch):

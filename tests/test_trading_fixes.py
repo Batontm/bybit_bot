@@ -56,7 +56,8 @@ def test_dca_after_pyramiding(monkeypatch):
 def test_config_signs():
     assert cfg.PYRAMIDING_TRIGGER < 0
     assert cfg.DCA_TRIGGER_PERCENT < 0
-    assert cfg.STALE_MOVE_THRESHOLD > 0
+    assert cfg.EXIT_TIME_MIN_R > 0
+    assert cfg.EXIT_BREAKEVEN_FEE_BUFFER > 2 * cfg.TRADING_FEE_RATE   # безубыток покрывает комиссии
 
 
 # ----------------------------------------------------------------- точность
@@ -188,10 +189,14 @@ async def test_partial_fill_reduces_quantity():
     svc = PositionService.__new__(PositionService)
     svc.trades_repo = repo
     svc.client = _CancelClient()
-    msg = await svc._handle_exit_fill({'position_id': pid, 'is_tp': True}, 'PartiallyFilledCanceled', 4.0, 105.0, 0.0)
-    assert msg is None
+    msg = await svc._handle_exit_fill({'position_id': pid, 'is_tp': True}, 'Filled', 4.0, 105.0, 0.0)
+    # TP1: часть зафиксирована, позиция открыта с остатком, прибыль части учтена
+    assert msg.startswith('🎯 TP1 SOLUSDT')
     pos = repo.get_position_by_id(pid)
     assert pos['status'] == 'OPEN' and pos['quantity'] == pytest.approx(6.0)
+    assert pos['partial_taken'] == 1 and pos['partial_pnl'] == pytest.approx(20.0)
+    # SL-ордера в БД нет → стоп отмечен в позиции и предупреждение в сообщении
+    assert '⚠️' in msg and pos['sl_price'] == pytest.approx(100 * (1 + cfg.EXIT_BREAKEVEN_FEE_BUFFER))
 
 
 def test_order_position_id_lookup():

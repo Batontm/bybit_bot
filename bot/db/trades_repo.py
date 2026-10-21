@@ -212,8 +212,9 @@ class TradesRepository:
             cursor.execute("""
                 INSERT INTO positions (
                     pair, entry_price, quantity, current_price,
-                    tp_price, sl_price, status, opened_at, slippage, commission_paid
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tp_price, sl_price, status, opened_at, slippage, commission_paid,
+                    initial_sl, entry_atr, tp1_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position_data['pair'],
                 position_data['entry_price'],
@@ -225,6 +226,9 @@ class TradesRepository:
                 position_data.get('opened_at', datetime.now(TIMEZONE).isoformat()),
                 position_data.get('slippage', 0) or 0,
                 position_data.get('commission_paid', 0) or 0,
+                position_data.get('initial_sl', position_data.get('sl_price')),
+                position_data.get('entry_atr'),
+                position_data.get('tp1_price'),
             ))
             
             position_id = cursor.lastrowid
@@ -305,6 +309,20 @@ class TradesRepository:
             
             return [dict(row) for row in cursor.fetchall()]
     
+    @staticmethod
+    def set_position_fields(position_id: int, **fields) -> None:
+        """Обновить произвольные поля позиции (только известные колонки)."""
+        allowed = {'partial_taken', 'partial_pnl', 'quantity', 'sl_price', 'tp_price',
+                   'commission_paid', 'initial_sl', 'entry_atr', 'tp1_price'}
+        items = [(k, v) for k, v in fields.items() if k in allowed]
+        if not items:
+            return
+        with get_transaction() as conn:
+            conn.execute(
+                f"UPDATE positions SET {', '.join(f'{k} = ?' for k, _ in items)} WHERE id = ?",
+                (*[v for _, v in items], position_id),
+            )
+
     @staticmethod
     def get_position_by_id(position_id: int) -> Optional[Dict]:
         """Получить позицию по ID"""

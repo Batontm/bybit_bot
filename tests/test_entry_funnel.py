@@ -222,8 +222,8 @@ def test_trade_plan_stop_below_pullback_and_tp_in_r():
 
 
 def test_trade_plan_min_and_max_stop():
-    plan, _ = F.build_trade_plan(entry=100.0, pullback_low=99.9, atr_1h=1.0)
-    assert plan.entry - plan.stop == pytest.approx(0.5)   # не ближе 0.5×ATR
+    plan, _ = F.build_trade_plan(entry=100.0, pullback_low=99.9, atr_1h=3.0)
+    assert plan.entry - plan.stop == pytest.approx(1.5)   # не ближе 0.5×ATR
     plan, why = F.build_trade_plan(entry=100.0, pullback_low=96.0, atr_1h=1.0)
     assert plan is None and 'далеко' in why               # дальше 2.5×ATR — пропуск
 
@@ -233,3 +233,16 @@ def test_returns_correlation():
     b = [x * 2 for x in a]
     assert F.returns_correlation(a, b) == pytest.approx(1.0, abs=1e-6)
     assert F.returns_correlation(a[:10], b[:10]) is None
+
+
+def test_trade_plan_rejects_fee_dominated_stop():
+    # стоп 0.4% от цены: комиссии ≈0.25% — больше четверти риска
+    plan, why = F.build_trade_plan(entry=100.0, pullback_low=99.7, atr_1h=0.5)
+    assert plan is None and 'комиссии' in why
+
+
+def test_trade_plan_has_partial_level_and_net_rr():
+    plan, why = F.build_trade_plan(entry=100.0, pullback_low=98.5, atr_1h=1.0)
+    assert plan.partial == pytest.approx(100 + 1.5 * 1.6)
+    assert plan.net_rr == pytest.approx((4.0 - 0.25) / (1.6 + 0.25))
+    assert plan.atr == 1.0

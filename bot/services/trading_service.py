@@ -70,6 +70,12 @@ class TradingService:
         Проверить все риск-лимиты перед открытием позиции
         Returns: (можно_открывать, причина_если_нет)
         """
+        # 0. Защита счёта: серия убытков, просадка от пика
+        from .account_guard import account_guard
+        allowed, guard_reason = account_guard.entries_allowed()
+        if not allowed:
+            return False, guard_reason
+
         # 1. Проверка количества открытых позиций
         open_positions = self.trades_repo.get_open_positions()
         if len(open_positions) >= MAX_OPEN_POSITIONS:
@@ -280,8 +286,12 @@ class TradingService:
         position_size = position_size * score_multiplier
         logger.info(f"📊 Score sizing: score={score}, multiplier={score_multiplier:.2f}")
         
+        from .exit_rules import levels
+        r_mult = (tp_price - current_price) / (current_price - sl_price) if current_price > sl_price else 2.5
+        lv = levels(current_price, sl_price, r_mult)
         return await self._execute_entry(
-            pair, position_size, current_price, tp_price, sl_price, limit_price=None
+            pair, position_size, current_price, tp_price, sl_price, limit_price=None,
+            tp1_price=lv.partial,
         )
 
     # ------------------------------------------------------------------ FUNNEL
@@ -313,14 +323,21 @@ class TradingService:
         if entry <= plan.stop:
             return None, f"Цена {entry} уже ниже стопа {plan.stop:.6g}"
 
-        # Пересчитываем тейк от реальной цены входа, стоп — структурный уровень
-        risk_per_unit = entry - plan.stop
+        # Пересчитываем уровни от реальной цены входа, стоп — структурный уровень
+        from .exit_rules import levels, position_size as size_with_costs, fee_filter
         r_multiple = (plan.take_profit - plan.entry) / plan.risk_per_unit if plan.risk_per_unit > 0 else 2.5
-        tp_price = entry + r_multiple * risk_per_unit
+        lv = levels(entry, plan.stop, r_multiple)
+        ok, why = fee_filter(entry, plan.stop, lv.target)
+        if not ok:
+            return None, f"После пересчёта от цены входа: {why}"
 
-        position_size = balance_service.calculate_position_size(MAX_RISK_PER_TRADE, entry, plan.stop)
+        # Размер: при срабатывании стопа теряем risk_fraction капитала ВКЛЮЧАЯ комиссии
+        risk_fraction, risk_note = self.risk_fraction()
+        position_size = size_with_costs(balance_service.get_deposit_usdt(), risk_fraction, entry, plan.stop)
         if position_size <= 0:
             return None, "Не удалось рассчитать размер позиции"
+        if risk_note:
+            logger.info(f"📊 {pair}: {risk_note}")
 
         # Не тратим больше свободного USDT
         try:
@@ -332,13 +349,34 @@ class TradingService:
             pass
 
         return await self._execute_entry(
-            pair, position_size, entry, tp_price, plan.stop,
+            pair, position_size, entry, lv.target, plan.stop,
             limit_price=entry if use_limit and bid > 0 else None,
+            tp1_price=lv.partial, entry_atr=getattr(plan, 'atr', None),
         )
+
+    def risk_fraction(self) -> Tuple[float, str]:
+        """
+        Доля капитала под риск в сделке. При панике на рынке (ATR BTC 4H выше
+        своего среднего) риск уменьшается пропорционально, но не ниже VOL_RISK_MIN_FACTOR.
+        """
+        from config.trading_config import VOL_RISK_SCALING, VOL_RISK_MIN_FACTOR
+        base = MAX_RISK_PER_TRADE
+        if not VOL_RISK_SCALING:
+            return base, ""
+        try:
+            from .market_regime_service import market_regime_service
+            ratio = market_regime_service.get_status().atr_ratio
+        except Exception:
+            ratio = None
+        if ratio and ratio > 1.0:
+            factor = max(VOL_RISK_MIN_FACTOR, 1.0 / ratio)
+            return base * factor, f"рынок волатилен (ATR ×{ratio:.2f}) — риск сделки {base * factor * 100:.2f}% вместо {base * 100:.2f}%"
+        return base, ""
 
     async def _execute_entry(self, pair: str, quantity: float, expected_price: float,
                              tp_price: float, sl_price: float, *,
-                             limit_price: Optional[float]) -> Tuple[Optional[Dict], Optional[str]]:
+                             limit_price: Optional[float], tp1_price: Optional[float] = None,
+                             entry_atr: Optional[float] = None) -> Tuple[Optional[Dict], Optional[str]]:
         """
         Разместить ордер на покупку, дождаться исполнения и записать позицию
         по ФАКТИЧЕСКОЙ средней цене и количеству (за вычетом комиссии в монете).
@@ -418,6 +456,7 @@ class TradingService:
             'pair': pair, 'entry_price': avg_price, 'quantity': net_qty,
             'tp_price': tp_price, 'sl_price': sl_price, 'opened_at': now,
             'slippage': slippage, 'commission_paid': fee * avg_price,
+            'initial_sl': sl_price, 'entry_atr': entry_atr, 'tp1_price': tp1_price,
         })
         try:
             from ..db.connection import get_transaction
@@ -426,7 +465,7 @@ class TradingService:
         except Exception:
             pass
 
-        await self._place_tp_sl_orders(pair, net_qty, tp_price, sl_price, position_id)
+        await self._place_tp_sl_orders(pair, net_qty, tp_price, sl_price, position_id, tp1_price=tp1_price)
         logger.info(f"✅ {pair}: позиция #{position_id} {net_qty} @ {avg_price} "
                     f"(ожидали {expected_price}, проскальзывание {slippage*100:+.3f}%)")
 
@@ -434,6 +473,7 @@ class TradingService:
             'position_id': position_id, 'order_id': order_id, 'pair': pair,
             'entry_price': avg_price, 'quantity': net_qty,
             'tp_price': tp_price, 'sl_price': sl_price, 'slippage': slippage,
+            'tp1_price': tp1_price,
         }, None
 
     async def _wait_fill(self, pair: str, order_id: str, timeout: float) -> Dict:
@@ -483,73 +523,59 @@ class TradingService:
                 logger.debug(f"get order {order_id}: {e}")
         return None
     
-    async def _place_tp_sl_orders(self, pair: str, quantity: float, 
+    async def _place_tp_sl_orders(self, pair: str, quantity: float,
                                    tp_price: float, sl_price: float,
-                                   position_id: int) -> None:
-        """Разместить TP и SL ордера"""
+                                   position_id: int, tp1_price: Optional[float] = None) -> None:
+        """
+        Разместить защиту позиции:
+          • TP1 — лимит на EXIT_PARTIAL_FRACTION позиции по tp1_price (если включено и
+            обе части не меньше минимального ордера);
+          • TP2 — лимит на остаток по tp_price;
+          • SL — условный рыночный ордер на всё количество (после TP1 объём уменьшается).
+        """
+        from config.trading_config import EXIT_PARTIAL_ENABLED, EXIT_PARTIAL_FRACTION
+        now = datetime.now(TIMEZONE).isoformat()
+
+        def save(order_id, price, qty, otype, **flags):
+            self.trades_repo.create_order({
+                'order_id': order_id, 'pair': pair, 'side': 'Sell', 'order_type': otype,
+                'price': price, 'quantity': qty, 'status': 'New', 'position_id': position_id,
+                'created_at': now, 'updated_at': now, **flags,
+            })
+
         try:
-            # TP ордер (лимитный)
-            formatted_qty = self._format_qty(pair, quantity)
-            
-            tp_response = self.client.place_order(
-                category="spot",
-                symbol=pair,
-                side="Sell",
-                orderType="Limit",
-                qty=formatted_qty,
-                price=self._format_price(pair, tp_price),
-                marketUnit="baseCoin"
-            )
-            
-            if tp_response['retCode'] == 0:
-                tp_order_id = tp_response['result']['orderId']
-                
-                self.trades_repo.create_order({
-                    'order_id': tp_order_id,
-                    'pair': pair,
-                    'side': 'Sell',
-                    'order_type': 'Limit',
-                    'price': tp_price,
-                    'quantity': quantity,
-                    'status': 'New',
-                    'is_tp': True,
-                    'position_id': position_id,
-                    'created_at': datetime.now(TIMEZONE).isoformat(),
-                    'updated_at': datetime.now(TIMEZONE).isoformat()
-                })
-                
-                logger.info(f"✅ TP ордер размещён: {pair} @ {tp_price}")
-            
-            # SL ордер (рыночный стоп-лосс через triggerPrice)
+            parts = [(tp_price, quantity)]
+            if EXIT_PARTIAL_ENABLED and tp1_price and tp1_price < tp_price:
+                q1 = float(self._format_qty(pair, quantity * EXIT_PARTIAL_FRACTION))
+                q2 = float(self._format_qty(pair, quantity - q1))
+                if q1 * tp1_price >= MIN_ORDER_SIZE_USD and q2 * tp_price >= MIN_ORDER_SIZE_USD:
+                    parts = [(tp1_price, q1), (tp_price, q2)]
+                else:
+                    logger.info(f"ℹ️ {pair}: позиция мала для частичной фиксации — один тейк")
+
+            for price, qty in parts:
+                resp = self.client.place_order(
+                    category="spot", symbol=pair, side="Sell", orderType="Limit",
+                    qty=self._format_qty(pair, qty), price=self._format_price(pair, price),
+                    marketUnit="baseCoin",
+                )
+                if resp.get('retCode') == 0:
+                    save(resp['result']['orderId'], price, qty, 'Limit', is_tp=True)
+                    logger.info(f"✅ TP ордер размещён: {pair} {qty} @ {price}")
+                else:
+                    logger.error(f"❌ TP {pair} @ {price}: {resp.get('retMsg')}")
+
             sl_response = self.client.place_order(
-                category="spot",
-                symbol=pair,
-                side="Sell",
-                orderType="Market",
-                qty=formatted_qty,
-                triggerPrice=self._format_price(pair, sl_price),
-                marketUnit="baseCoin"
+                category="spot", symbol=pair, side="Sell", orderType="Market",
+                qty=self._format_qty(pair, quantity),
+                triggerPrice=self._format_price(pair, sl_price), marketUnit="baseCoin",
             )
-            
-            if sl_response['retCode'] == 0:
-                sl_order_id = sl_response['result']['orderId']
-                
-                self.trades_repo.create_order({
-                    'order_id': sl_order_id,
-                    'pair': pair,
-                    'side': 'Sell',
-                    'order_type': 'Market',
-                    'price': sl_price,
-                    'quantity': quantity,
-                    'status': 'New',
-                    'is_sl': True,
-                    'position_id': position_id,
-                    'created_at': datetime.now(TIMEZONE).isoformat(),
-                    'updated_at': datetime.now(TIMEZONE).isoformat()
-                })
-                
+            if sl_response.get('retCode') == 0:
+                save(sl_response['result']['orderId'], sl_price, quantity, 'Market', is_sl=True)
                 logger.info(f"✅ SL ордер размещён: {pair} @ {sl_price}")
-                
+            else:
+                logger.error(f"❌ SL {pair}: {sl_response.get('retMsg')} — подхватит Auto-SL")
+
         except Exception as e:
             error_tracker.add_error("Bybit", "TPSLError", str(e))
             logger.error(f"❌ Ошибка размещения TP/SL: {e}")
@@ -669,16 +695,24 @@ class TradingService:
             return None
 
     async def _resize_protection(self, position_id: int, pair: str, new_qty: float) -> None:
-        """Увеличить qty у активных TP и SL ордеров позиции после докупки."""
+        """
+        Подогнать объёмы защитных ордеров под новое количество позиции:
+        SL — на всё количество, тейки (TP1/TP2) — пропорционально прежним долям.
+        """
         from ..db.connection import get_db
         with get_db() as conn:
             rows = conn.execute("""
-                SELECT order_id, is_tp, is_sl FROM orders
+                SELECT order_id, is_tp, is_sl, quantity FROM orders
                 WHERE position_id = ? AND (is_tp = 1 OR is_sl = 1)
                   AND status IN ('New', 'PartiallyFilled', 'Untriggered', 'Triggered', 'Active')
             """, (position_id,)).fetchall()
-        qty_str = self._format_qty(pair, new_qty)
+        tp_total = sum(float(r['quantity'] or 0) for r in rows if r['is_tp'])
         for r in rows:
+            if r['is_tp'] and tp_total > 0:
+                target = new_qty * float(r['quantity'] or 0) / tp_total
+            else:
+                target = new_qty
+            qty_str = self._format_qty(pair, target)
             try:
                 resp = self.client.amend_order(category="spot", symbol=pair,
                                                orderId=r['order_id'], qty=qty_str)

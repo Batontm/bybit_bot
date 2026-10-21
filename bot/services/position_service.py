@@ -9,10 +9,10 @@ from pybit.unified_trading import HTTP
 from config.settings import logger, TIMEZONE
 from config.api_config import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_ACCOUNT_TYPE, get_pybit_kwargs
 from config.trading_config import (
-    TRAILING_ACTIVATION, TRAILING_STEP,
-    BREAKEVEN_ENABLED, BREAKEVEN_TRIGGER_PERCENT, BREAKEVEN_BUFFER,
-    TIME_EXIT_ENABLED, MAX_POSITION_HOURS, STALE_MOVE_THRESHOLD
+    BREAKEVEN_ENABLED, TRAILING_ENABLED, TIME_EXIT_ENABLED,
+    EXIT_PARTIAL_ENABLED, EXIT_PARTIAL_R, EXIT_TRAIL_MIN_STEP, DEFAULT_SL_PERCENT,
 )
+from . import exit_rules
 
 from ..db.trades_repo import TradesRepository
 from ..db.pnl_repo import PnLRepository
@@ -251,12 +251,28 @@ class PositionService:
         kind = "TP" if order.get('is_tp') else "SL"
 
         if filled_qty < qty * 0.95:
-            # частичное исполнение: уменьшаем позицию, защиту оставляем
-            self.trades_repo.update_position_quantity(position_id, max(0.0, qty - filled_qty))
-            logger.info(f"📉 {pair}: {kind} исполнен частично {filled_qty}/{qty}")
-            return None
+            remaining = max(0.0, qty - filled_qty)
+            part_pnl = (avg_price - entry) * filled_qty - exit_fee_usdt
+            self.trades_repo.set_position_fields(
+                position_id, quantity=remaining,
+                partial_pnl=float(pos.get('partial_pnl') or 0) + part_pnl,
+                partial_taken=1 if kind == "TP" else int(pos.get('partial_taken') or 0),
+            )
+            if kind != "TP":
+                logger.info(f"📉 {pair}: SL исполнен частично {filled_qty}/{qty}")
+                return None
+            # TP1: стоп остатка — в безубыток с запасом на комиссии, объём — на остаток
+            new_sl = max(float(pos.get('sl_price') or 0), exit_rules.breakeven_stop(entry))
+            moved = await self._amend_sl(position_id, pair, new_sl, remaining)
+            sign = "+" if part_pnl >= 0 else "-"
+            msg = (f"🎯 TP1 {pair}: зафиксировано {filled_qty:g} @ {avg_price:.6g} "
+                   f"({sign}${abs(part_pnl):.2f}); остаток {remaining:g}"
+                   + (f", стоп → безубыток {new_sl:.6g}" if moved else ", ⚠️ стоп не перенесён — проверьте"))
+            logger.info(msg)
+            return msg
 
-        gross = (avg_price - entry) * filled_qty
+        partial = float(pos.get('partial_pnl') or 0)
+        gross = (avg_price - entry) * filled_qty + partial
         entry_fee = float(pos.get('commission_paid') or 0)
         fees = entry_fee + exit_fee_usdt
         net = gross - fees
@@ -272,10 +288,15 @@ class PositionService:
         await self._cancel_position_orders(position_id)
 
         pct = (avg_price - entry) / entry * 100 if entry else 0.0
-        emoji = "🎯" if kind == "TP" else "🛑"
+        if kind == "TP":
+            emoji, label = "🎯", "TP"
+        elif avg_price >= entry:
+            emoji, label = "🛡", "Стоп в плюсе (безубыток/трейлинг)"
+        else:
+            emoji, label = "🛑", "SL"
         sign = "+" if net >= 0 else "-"
-        msg = (f"{emoji} {kind} {pair}: позиция закрыта @ {avg_price:.6g} "
-               f"({pct:+.2f}%) | PnL {sign}${abs(net):.2f} (комиссии ${fees:.2f})")
+        msg = (f"{emoji} {label} {pair}: позиция закрыта @ {avg_price:.6g} "
+               f"({pct:+.2f}%) | PnL за сделку {sign}${abs(net):.2f} (комиссии ${fees:.2f})")
         logger.info(msg)
         return msg
 
@@ -390,66 +411,76 @@ class PositionService:
             except Exception as e:
                 logger.debug(f"Ошибка обновления цены {position['pair']}: {e}")
 
+    @staticmethod
+    def _risk_r(pos: dict) -> float:
+        """R позиции: вход − начальный стоп (для старых позиций — текущий стоп или стоп по умолчанию)."""
+        entry = float(pos.get('avg_entry_price') or pos['entry_price'])
+        initial = pos.get('initial_sl') or pos.get('sl_price')
+        if initial and float(initial) < entry:
+            return entry - float(initial)
+        return entry * DEFAULT_SL_PERCENT
+
+    async def _amend_sl(self, position_id: int, pair: str, new_sl: float,
+                        new_qty: Optional[float] = None) -> bool:
+        """Изменить цену (и при необходимости объём) активного SL на бирже и в БД."""
+        sl_order = self.trades_repo.get_sl_order(position_id)
+        if not sl_order:
+            logger.warning(f"⚠️ {pair}: нет активного SL для переноса — подхватит Auto-SL")
+            self.trades_repo.set_position_tpsl(position_id, sl_price=new_sl)
+            return False
+        params = dict(category="spot", symbol=pair, orderId=sl_order['order_id'],
+                      triggerPrice=self._format_price(pair, new_sl))
+        if new_qty is not None:
+            params['qty'] = self._format_qty(pair, new_qty)
+        for extra in ({}, {"orderFilter": "StopOrder"}, {"orderFilter": "tpslOrder"}):
+            try:
+                resp = self.client.amend_order(**params, **extra)
+            except Exception as e:
+                resp = {'retCode': -1, 'retMsg': str(e)}
+            if resp.get('retCode') == 0:
+                self.trades_repo.set_position_tpsl(position_id, sl_price=new_sl)
+                self.trades_repo.update_order_price(sl_order['order_id'], new_sl)
+                if new_qty is not None:
+                    from ..db.connection import get_transaction
+                    with get_transaction() as conn:
+                        conn.execute("UPDATE orders SET quantity = ? WHERE order_id = ?",
+                                     (new_qty, sl_order['order_id']))
+                return True
+            msg = str(resp.get('retMsg', ''))
+            if resp.get('retCode') == 170213 or 'does not exist' in msg.lower():
+                self.trades_repo.update_order_status(sl_order['order_id'], 'Cancelled')
+                return False
+        logger.error(f"❌ {pair}: не удалось перенести SL: {resp.get('retMsg')}")
+        return False
+
     async def update_trailing_stops(self) -> List[str]:
         """
-        Обновить Trailing Stops для прибыльных позиций
-        Returns: Список сообщений о передвинутых стопах
+        Трейлинг остатка позиции после частичной фиксации (TP1): стоп = цена − k×ATR(1h),
+        только вверх и только если поднимается хотя бы на EXIT_TRAIL_MIN_STEP.
+        Если частичная фиксация выключена — трейлинг включается с +EXIT_PARTIAL_R.
+        Уведомлений не шлёт (итог придёт при закрытии позиции).
         """
-        messages = []
-        open_positions = self.trades_repo.get_open_positions()
-        
-        for pos in open_positions:
+        if not TRAILING_ENABLED:
+            return []
+        for pos in self.trades_repo.get_open_positions():
             pair = pos['pair']
-            entry = pos.get('avg_entry_price') or pos['entry_price']
-            curr_sl = pos['sl_price'] or 0
-            
-            # Получаем актуальную цену
-            current_price = pos['current_price']
-            
-            # Если цена не обновлена, пропускаем
-            if not current_price or current_price <= 0:
+            price = float(pos.get('current_price') or 0)
+            if price <= 0:
                 continue
-            
-            # Расчёт профита
-            profit_pct = (current_price - entry) / entry
-            
-            # Если профит больше порога активации
-            if profit_pct > TRAILING_ACTIVATION:
-                # Рассчитываем новый SL (на расстоянии TRAILING_STEP)
-                new_sl = current_price * (1 - TRAILING_STEP)
-                
-                # Двигаем SL только вверх
-                if new_sl > curr_sl:
-                    try:
-                        # 1. Находим активный SL ордер
-                        sl_order = self.trades_repo.get_sl_order(pos['id'])
-                        if not sl_order:
-                            logger.warning(f" Нет активного SL ордера для {pair} (ID: {pos['id']})")
-                            continue
-                            
-                        # 2. Изменяем ордер на бирже
-                        response = self.client.amend_order(
-                            category="spot",
-                            symbol=pair,
-                            orderId=sl_order['order_id'],
-                            triggerPrice=self._format_price(pair, new_sl)
-                        )
-                        
-                        if response['retCode'] == 0:
-                            # 3. Обновляем в БД
-                            self.trades_repo.set_position_tpsl(pos['id'], sl_price=new_sl)
-                            self.trades_repo.update_order_price(sl_order['order_id'], new_sl)
-                            
-                            msg = f"📈 Трейлинг {pair}: SL подтянут до {new_sl:.6g} (прибыль {profit_pct*100:.2f}%)"
-                            logger.info(msg)
-                            messages.append(msg)
-                        else:
-                            logger.error(f" Ошибка изменения SL {pair}: {response['retMsg']}")
-                            
-                    except Exception as e:
-                        logger.error(f" Ошибка Trailing Stop {pair}: {e}")
-        
-        return messages
+            entry = float(pos.get('avg_entry_price') or pos['entry_price'])
+            r = self._risk_r(pos)
+            active = bool(pos.get('partial_taken')) or (
+                not EXIT_PARTIAL_ENABLED and price >= entry + EXIT_PARTIAL_R * r)
+            if not active:
+                continue
+            atr = float(pos.get('entry_atr') or 0) or r
+            cur_sl = float(pos.get('sl_price') or 0)
+            new_sl = exit_rules.trail_stop(cur_sl, price, atr)
+            if new_sl < cur_sl * (1 + EXIT_TRAIL_MIN_STEP) or new_sl >= price:
+                continue
+            if await self._amend_sl(pos['id'], pair, new_sl):
+                logger.info(f"📈 Трейлинг {pair}: SL {cur_sl:.6g} → {new_sl:.6g} (цена {price:.6g})")
+        return []
 
     async def close_position(self, position_id: int, reason: str = "manual") -> bool:
         """Закрыть позицию вручную"""
@@ -593,7 +624,8 @@ class PositionService:
     def _record_manual_pnl(self, position: dict, exit_price: float, qty: float) -> float:
         """PnL ручного/принудительного закрытия по рынку с учётом комиссий; пишет детализацию."""
         entry = float(position.get('avg_entry_price') or position['entry_price'])
-        gross = (exit_price - entry) * qty
+        # + уже зафиксированная часть (TP1)
+        gross = (exit_price - entry) * qty + float(position.get('partial_pnl') or 0)
         fees = float(position.get('commission_paid') or 0) + exit_price * qty * 0.001
         net = gross - fees
         try:
@@ -657,82 +689,32 @@ class PositionService:
     
     async def check_breakeven(self) -> List[str]:
         """
-        Проверить и активировать Breakeven для позиций с прибылью >= 1%
-        Returns: Список сообщений о перенесённых стопах
+        Безубыток при +EXIT_BREAKEVEN_R: стоп → вход + запас на комиссии полного круга.
+        Позиции после TP1 уже в безубытке (стоп переносится при исполнении TP1).
         """
         if not BREAKEVEN_ENABLED:
             return []
-        
         messages = []
-        open_positions = self.trades_repo.get_open_positions()
-        
-        for pos in open_positions:
-            # Пропускаем если breakeven уже активирован
-            if pos.get('breakeven_activated', 0) == 1:
+        for pos in self.trades_repo.get_open_positions():
+            if pos.get('breakeven_activated') or pos.get('partial_taken'):
                 continue
-            
-            pair = pos['pair']
-            entry = pos.get('avg_entry_price') or pos['entry_price']
-            current_price = pos['current_price']
-            
-            if not current_price or current_price <= 0:
+            price = float(pos.get('current_price') or 0)
+            if price <= 0:
                 continue
-            
-            # Расчёт профита
-            profit_pct = (current_price - entry) / entry
-            
-            # Если прибыль >= порога активации breakeven
-            if profit_pct >= BREAKEVEN_TRIGGER_PERCENT:
-                # Новый SL = цена входа + небольшой буфер
-                new_sl = entry * (1 + BREAKEVEN_BUFFER)
-                
-                try:
-                    # Находим активный SL ордер
-                    sl_order = self.trades_repo.get_sl_order(pos['id'])
-                    if not sl_order:
-                        logger.warning(f"⚠️ Нет SL ордера для breakeven {pair}")
-                        continue
-                    
-                    # Изменяем ордер на бирже
-                    response = self.client.amend_order(
-                        category="spot",
-                        symbol=pair,
-                        orderId=sl_order['order_id'],
-                        triggerPrice=self._format_price(pair, new_sl)
-                    )
-                    
-                    if response['retCode'] == 0:
-                        # Обновляем в БД
-                        self.trades_repo.set_position_tpsl(pos['id'], sl_price=new_sl)
-                        self.trades_repo.update_order_price(sl_order['order_id'], new_sl)
-                        self._set_breakeven_flag(pos['id'])
-                        
-                        msg = f"🛡️ Безубыток {pair}: SL перенесён в {new_sl:.6g} (вход {entry:.6g})"
-                        logger.info(msg)
-                        messages.append(msg)
-                    else:
-                        error_msg = response.get('retMsg', '')
-                        ret_code = response.get('retCode', 0)
-                        
-                        # Ордер не существует на бирже — удаляем из БД
-                        if ret_code == 170213 or 'does not exist' in error_msg:
-                            logger.warning(f"⚠️ SL ордер {pair} не найден на бирже, удаляем из БД")
-                            self.trades_repo.update_order_status(sl_order['order_id'], 'Cancelled')
-                            # auto_create_missing_sl пересоздаст ордер
-                        else:
-                            logger.error(f"❌ Ошибка breakeven {pair}: {error_msg}")
-                        
-                except Exception as e:
-                    error_str = str(e)
-                    # Ордер не существует — удаляем из БД
-                    if '170213' in error_str or 'does not exist' in error_str:
-                        logger.warning(f"⚠️ SL ордер {pair} не найден на бирже, удаляем из БД")
-                        sl_order = self.trades_repo.get_sl_order(pos['id'])
-                        if sl_order:
-                            self.trades_repo.update_order_status(sl_order['order_id'], 'Cancelled')
-                    else:
-                        logger.error(f"❌ Ошибка breakeven {pair}: {e}")
-        
+            entry = float(pos.get('avg_entry_price') or pos['entry_price'])
+            lv = exit_rules.levels(entry, entry - self._risk_r(pos))
+            if price < lv.breakeven_trigger:
+                continue
+            new_sl = exit_rules.breakeven_stop(entry)
+            if float(pos.get('sl_price') or 0) >= new_sl:
+                self._set_breakeven_flag(pos['id'])
+                continue
+            if await self._amend_sl(pos['id'], pos['pair'], new_sl):
+                self._set_breakeven_flag(pos['id'])
+                msg = (f"🛡️ Безубыток {pos['pair']}: цена прошла +1R, SL → {new_sl:.6g} "
+                       f"(вход {entry:.6g} + запас на комиссии)")
+                logger.info(msg)
+                messages.append(msg)
         return messages
     
     def _set_breakeven_flag(self, position_id: int) -> None:
@@ -745,55 +727,39 @@ class PositionService:
             """, (position_id,))
     
     async def check_time_exit(self) -> List[str]:
-        """
-        Закрыть позиции старше MAX_POSITION_HOURS без значимого движения
-        Returns: Список сообщений о закрытых позициях
-        """
+        """Закрыть позиции старше EXIT_TIME_HOURS, не дошедшие до +EXIT_TIME_MIN_R."""
         if not TIME_EXIT_ENABLED:
             return []
-        
         messages = []
-        open_positions = self.trades_repo.get_open_positions()
         now = datetime.now(TIMEZONE)
-        
-        for pos in open_positions:
-            pair = pos['pair']
-            entry = pos.get('avg_entry_price') or pos['entry_price']
-            current_price = pos['current_price']
-            
-            if not current_price or current_price <= 0:
+        for pos in self.trades_repo.get_open_positions():
+            if pos.get('partial_taken'):
+                continue  # после TP1 остаток защищён безубытком и трейлингом
+            price = float(pos.get('current_price') or 0)
+            if price <= 0:
                 continue
-            
-            # Парсим время открытия
             try:
                 opened_at = datetime.fromisoformat(pos['opened_at'].replace('Z', '+00:00'))
                 if opened_at.tzinfo is None:
                     opened_at = opened_at.replace(tzinfo=TIMEZONE)
             except Exception:
                 continue
-            
-            # Проверяем возраст позиции
-            position_age_hours = (now - opened_at).total_seconds() / 3600
-            
-            if position_age_hours < MAX_POSITION_HOURS:
+            age_h = (now - opened_at).total_seconds() / 3600
+            entry = float(pos.get('avg_entry_price') or pos['entry_price'])
+            r = self._risk_r(pos)
+            if not exit_rules.time_exit_due(age_h, price, entry, r):
                 continue
-            
-            # Проверяем движение цены
-            move_pct = abs((current_price - entry) / entry)
-            
-            if move_pct < STALE_MOVE_THRESHOLD:
-                # Позиция "мёртвая" - закрываем
-                try:
-                    closed = await self.close_position(pos['id'], reason="time_exit")
-                    
-                    if closed:
-                        msg = f"⏰ TIME EXIT {pair}: закрыта после {position_age_hours:.1f}ч (движение: {move_pct*100:.2f}%)"
-                        logger.info(msg)
-                        messages.append(msg)
-                        
-                except Exception as e:
-                    logger.error(f"❌ Ошибка time exit {pair}: {e}")
-        
+            try:
+                if await self.close_position(pos['id'], reason="time_exit"):
+                    after = self.trades_repo.get_position_by_id(pos['id']) or {}
+                    pnl = float(after.get('net_pnl') or after.get('realized_pnl') or 0)
+                    sign = "+" if pnl >= 0 else "-"
+                    msg = (f"⏰ Выход по времени {pos['pair']}: {age_h:.0f} ч без движения к цели "
+                           f"(сейчас {(price - entry) / r:+.2f}R) | PnL {sign}${abs(pnl):.2f}")
+                    logger.info(msg)
+                    messages.append(msg)
+            except Exception as e:
+                logger.error(f"❌ Ошибка time exit {pos['pair']}: {e}")
         return messages
     
     async def auto_create_missing_sl(self) -> List[str]:

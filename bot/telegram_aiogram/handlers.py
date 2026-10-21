@@ -132,6 +132,15 @@ def _settings_kb(controller) -> InlineKeyboardBuilder:
                 alerts = bool(controller.is_alerts_enabled())
         except Exception:
             pass
+    try:
+        from bot.services.account_guard import account_guard
+        g = account_guard.status()
+        if g['drawdown_halt']:
+            kb.button(text="▶️ Снять стоп по просадке", callback_data="tg:dd_reset")
+        if g['streak_pause_until']:
+            kb.button(text="▶️ Снять паузу после серии убытков", callback_data="tg:streak_ack")
+    except Exception:
+        pass
     mode = controller.get_mode() if controller is not None and hasattr(controller, 'get_mode') else None
     if mode == "PAUSED":
         kb.button(text="▶️ Возобновить работу (сейчас пауза)", callback_data="tg:resume")
@@ -155,6 +164,26 @@ def _service_kb() -> InlineKeyboardBuilder:
     kb.button(text="⬅️ Назад", callback_data="tg:menu")
     kb.adjust(1)
     return kb
+
+
+def _guard_lines() -> list:
+    """Состояние защиты счёта для дашборда и настроек."""
+    try:
+        from bot.services.account_guard import account_guard
+        from config.trading_config import MAX_CONSECUTIVE_LOSSES, MAX_DRAWDOWN_STOP
+        g = account_guard.status()
+    except Exception:
+        return []
+    out = []
+    if g['drawdown_halt']:
+        out.append(f"⛔️ Входы остановлены: просадка ≥ {MAX_DRAWDOWN_STOP * 100:.0f}% от пика {_usd(g['equity_peak'])}")
+    if g['streak_pause_until']:
+        out.append(f"⏸ Пауза входов после {g['loss_streak']} убытков подряд — до "
+                   f"{g['streak_pause_until'].strftime('%d.%m %H:%M')}")
+    if not out:
+        out.append(f"🛡 Защита счёта: серия убытков {g['loss_streak']}/{MAX_CONSECUTIVE_LOSSES}, "
+                   f"стоп при просадке {MAX_DRAWDOWN_STOP * 100:.0f}% от пика {_usd(g['equity_peak'])}")
+    return out
 
 
 def _format_settings_text(controller) -> str:
@@ -183,6 +212,7 @@ def _format_settings_text(controller) -> str:
     except Exception:
         pass
     lines.append(f"🤖 Авто-торговля: <b>{_st(auto)}</b>")
+    lines.extend(_guard_lines())
     if ENTRY_STRATEGY == "FUNNEL":
         lines.append("🧭 Стратегия входа: <b>воронка</b> (пары отбираются автоматически)")
     else:
@@ -464,6 +494,7 @@ def _format_health(controller) -> str:
                 lines.append("⏸ Авто-торговля выключена (Настройки)")
         except Exception:
             pass
+    lines.extend(l for l in _guard_lines() if l.startswith(("⛔", "⏸")))
 
     lines.append("")
     lines.append(_format_balances_block())
@@ -1213,6 +1244,15 @@ def create_router(controller=None) -> Router:
                 text = (f"⚠️ Не удалось закрыть {coin}. Подробности — в «🛠 Сервис → ⚠️ Лог ошибок». "
                         f"Можно повторить или закрыть вручную на Bybit.")
             await _send_text_cb(callback, text, reply_markup=back.as_markup())
+        elif data in ("tg:dd_reset", "tg:streak_ack"):
+            from bot.services.account_guard import account_guard
+            if data == "tg:dd_reset":
+                equity = await _bg(lambda: (balance_service.get_all_balances(),
+                                            getattr(balance_service, 'last_total_equity', None))[1])
+                account_guard.reset_drawdown(equity)
+            else:
+                account_guard.ack_loss_streak()
+            await _send_text_cb(callback, _format_settings_text(controller), reply_markup=_settings_kb(controller).as_markup())
         elif data in ("tg:pause", "tg:resume"):
             if controller is None or not hasattr(controller, "set_mode"):
                 await _send_text_cb(callback, "❌ Недоступно", reply_markup=kb)

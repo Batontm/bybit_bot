@@ -14,6 +14,7 @@
   4. orderbook_metrics, aggressor_share, oi_signal, funding, long/short    (баллы / вето)
   5. score_candidate      — итоговый балл 0..100 + список вето
      build_trade_plan     — стоп за минимумом отката, тейк в R, проверка ширины стопа
+                            и фильтр комиссий (exit_rules.fee_filter)
 """
 from __future__ import annotations
 
@@ -388,6 +389,9 @@ class TradePlan:
     take_profit: float
     risk_per_unit: float
     stop_pct: float
+    atr: float = 0.0          # ATR(1h) на момент входа — для трейлинга
+    partial: Optional[float] = None
+    net_rr: float = 0.0
 
 
 def build_trade_plan(entry: float, pullback_low: float, atr_1h: float,
@@ -412,8 +416,14 @@ def build_trade_plan(entry: float, pullback_low: float, atr_1h: float,
     if stop <= 0:
         return None, 'некорректный стоп'
     tp = entry + tp_r * dist
+    from .exit_rules import fee_filter, levels, net_rr
+    ok, why = fee_filter(entry, stop, tp)
+    if not ok:
+        return None, why
+    lv = levels(entry, stop, tp_r)
     return TradePlan(entry=entry, stop=stop, take_profit=tp, risk_per_unit=dist,
-                     stop_pct=dist / entry), 'OK'
+                     stop_pct=dist / entry, atr=atr_1h, partial=lv.partial,
+                     net_rr=net_rr(entry, stop, tp)), why
 
 
 def returns_correlation(closes_a: Sequence[float], closes_b: Sequence[float]) -> Optional[float]:

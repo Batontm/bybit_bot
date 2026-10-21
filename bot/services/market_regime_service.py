@@ -11,6 +11,35 @@ from config.settings import logger, TIMEZONE
 from .indicators_service import TechnicalIndicators, closed_candles
 
 
+def regime_metrics(candles, ema_period: int = 200, rsi_period: int = 14, atr_windows: int = 30):
+    """
+    Чистый расчёт показателей светофора по ЗАКРЫТЫМ 4h свечам BTC.
+    Returns: (price, ema200, rsi14, atr_ratio) — любое может быть None при нехватке данных.
+    Используется живым ботом и бэктестером.
+    """
+    closes = [c['close'] for c in candles]
+    highs = [c['high'] for c in candles]
+    lows = [c['low'] for c in candles]
+    price = closes[-1] if closes else None
+    ema = TechnicalIndicators.calculate_ema(closes, ema_period)
+    rsi = TechnicalIndicators.calculate_rsi(closes, rsi_period)
+    atr_ratio = None
+    atrs = TechnicalIndicators.atr_series(highs, lows, closes, 14)
+    if len(atrs) > atr_windows:
+        prev = atrs[-(atr_windows + 1):-1]
+        avg = sum(prev) / len(prev)
+        if avg > 0:
+            atr_ratio = atrs[-1] / avg
+    return price, ema, rsi, atr_ratio
+
+
+def regime_allowed(price, ema, rsi, atr_ratio, rsi_min: float = 40, atr_spike: float = 2.0) -> bool:
+    if price is None or ema is None or rsi is None:
+        return False
+    atr_blocked = atr_ratio is not None and atr_ratio > atr_spike
+    return price > ema and rsi >= rsi_min and not atr_blocked
+
+
 @dataclass
 class RegimeStatus:
     allowed: bool
@@ -81,25 +110,9 @@ class MarketRegimeService:
                 )
 
             candles = closed_candles(resp["result"]["list"])
-            closes = [c['close'] for c in candles]
-            highs = [c['high'] for c in candles]
-            lows = [c['low'] for c in candles]
-
-            price = closes[-1] if closes else None
-            ema200 = TechnicalIndicators.calculate_ema(closes, self.EMA_PERIOD)
-            rsi14 = TechnicalIndicators.calculate_rsi(closes, self.RSI_PERIOD)
-
-            # ATR volatility spike detection
-            # Раньше «средний» ATR считался как ATR14, сдвинутый на одну свечу, — отношение
-            # всегда было ~1.0 и фильтр паники никогда не срабатывал.
-            atr_ratio = None
-            atrs = TechnicalIndicators.atr_series(highs, lows, closes, 14)
-            if len(atrs) > self.ATR_AVG_WINDOWS:
-                current_atr = atrs[-1]
-                prev = atrs[-(self.ATR_AVG_WINDOWS + 1):-1]
-                avg_atr = sum(prev) / len(prev)
-                if avg_atr > 0:
-                    atr_ratio = current_atr / avg_atr
+            # ATR-паника: текущий ATR14 против среднего ATR14 за ATR_AVG_WINDOWS окон
+            price, ema200, rsi14, atr_ratio = regime_metrics(
+                candles, self.EMA_PERIOD, self.RSI_PERIOD, self.ATR_AVG_WINDOWS)
 
             if price is None or ema200 is None or rsi14 is None:
                 reason = (
@@ -119,7 +132,7 @@ class MarketRegimeService:
             # ATR spike check — блокировка при панике на рынке
             atr_blocked = atr_ratio is not None and atr_ratio > self.ATR_SPIKE_MULTIPLIER
 
-            ok = (price > ema200) and (rsi14 >= self.RSI_MIN) and (not atr_blocked)
+            ok = regime_allowed(price, ema200, rsi14, atr_ratio, self.RSI_MIN, self.ATR_SPIKE_MULTIPLIER)
             if ok:
                 label = "ЗЕЛЕНЫЙ"
                 atr_info = f", ATR_ratio={atr_ratio:.2f}" if atr_ratio else ""

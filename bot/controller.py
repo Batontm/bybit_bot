@@ -38,7 +38,7 @@ from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 
 
-BOT_VERSION = "v2.4.0"
+BOT_VERSION = "v2.5.0"
 
 
 class BotController:
@@ -551,10 +551,14 @@ class BotController:
             logger.debug(f"Ошибка логирования отказа: {e}")
     
     async def _update_balances(self):
-        """Обновление балансов"""
+        """Обновление балансов + контроль просадки от пика капитала"""
         try:
             deposit = self.balance_service.get_deposit_usdt()
             logger.debug(f"💰 Депозит USDT: {deposit:.2f}")
+            from .services.account_guard import account_guard
+            msg = account_guard.update_equity(getattr(self.balance_service, 'last_total_equity', None))
+            if msg:
+                await self._send_notification(msg)
         except Exception as e:
             logger.error(f"❌ Ошибка обновления балансов: {e}")
     
