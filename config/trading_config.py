@@ -179,7 +179,9 @@ TREND_MAX_POSITIONS = 3
 # --- Фильтры пробоя по открытым данным других бирж (bot/services/ext_market_data.py) ---
 # Ключи API не нужны. Включать только после бэктеста:
 #   python -m bot.backtest --strategy trend --days 1095 --ext
-TREND_EXT_FUNDING = False          # не входить, если лонги перегреты (funding Bybit+Binance)
+TREND_EXT_FUNDING = True           # не входить, если лонги перегреты (funding Bybit+Binance)
+                                   # бэктест 3 года: walk-forward +0.76R / PF 2.79 против +0.64R / 2.32 без фильтра
+                                   # объём — без улучшения на проверке, премия Coinbase — ухудшает (−0.12R)
 TREND_EXT_FUNDING_MAX_DAY = 0.0006 # сумма ставок за сутки > 0.06% (норма ~0.03%: 0.01% × 3)
 TREND_EXT_VOLUME = False           # пробой только на объёме выше среднего (Bybit + Binance)
 TREND_EXT_VOLUME_MIN = 1.0         # объём дня / средний за 20 дней

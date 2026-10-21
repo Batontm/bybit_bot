@@ -332,7 +332,8 @@ def test_build_features_and_filter(monkeypatch):
 def test_run_trend_ext_filter_blocks_entries(dataset):
     from bot.services import trend_strategy as T
     start, end = _period(dataset, 60)
-    params = {'TREND_FILTER_EMA': 20, 'TREND_BREAKOUT_DAYS': 5}
+    params = {'TREND_FILTER_EMA': 20, 'TREND_BREAKOUT_DAYS': 5, 'TREND_EXT_FUNDING': False,
+              'TREND_EXT_VOLUME': False, 'TREND_EXT_PREMIUM': False}
     with E.override(params):
         base = E.run_trend(dataset, ['BTCUSDT', 'ALTUSDT'], start_ts=start, end_ts=end)
     feats = {p: {d['start']: {'funding_day': 0.01, 'volume_ratio': None, 'cb_premium': None}

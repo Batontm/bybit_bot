@@ -38,7 +38,7 @@ from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 
 
-BOT_VERSION = "v2.7.0"
+BOT_VERSION = "v2.7.1"
 
 
 class BotController:
