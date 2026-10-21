@@ -143,7 +143,10 @@ class AiogramTelegramBot:
         lines = [
             f"🤖 <b>Бот запущен</b> ({BOT_VERSION})",
             account,
-            f"Режим: {_ctrl.get_mode()} | Стратегии: {ENTRY_STRATEGY}{' + TREND' if TREND_ENABLED else ''}",
+            f"Режим: {_ctrl.get_mode()} | Стратегии: "
+            f"{'TREND (сделки)' if TREND_ENABLED else ''}"
+            f"{' + ' if TREND_ENABLED else ''}{ENTRY_STRATEGY} "
+            f"({'сделки' if _ctrl.is_funnel_trading_enabled() else 'только сигналы'})",
         ]
         if TRADING_CAPITAL_LIMIT_USDT:
             lines.append(f"Лимит капитала для бота: ${TRADING_CAPITAL_LIMIT_USDT:,.0f}")

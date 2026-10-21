@@ -38,7 +38,7 @@ from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 
 
-BOT_VERSION = "v2.6.0"
+BOT_VERSION = "v2.6.2"
 
 
 class BotController:
@@ -50,6 +50,9 @@ class BotController:
         self.pause_reason: str = ""  # panic / manual — пауза снимается только вручную
         self.last_signal_check: Dict | None = None
         self.auto_trading_enabled = True
+        from config import trading_config as _cfg
+        self.funnel_trading_enabled = bool(getattr(_cfg, 'FUNNEL_TRADING_ENABLED', True))
+        self._signal_notified: Dict[str, float] = {}
         self.scanner_enabled = False  # По умолчанию выключен
         self.started_at: datetime = datetime.now(TIMEZONE)
 
@@ -505,6 +508,9 @@ class BotController:
             entry_funnel_service.scan, exclude=open_pairs + arb_pairs, always_include=self.fixed_pairs
         )
         repo = entry_funnel_service.repo
+        if not self.funnel_trading_enabled:
+            await self._funnel_signal_only(candidates)
+            return
         self._note_signal("🧭 воронка", f"кандидатов: {len(candidates)}" if candidates else "кандидатов нет")
 
         for c in candidates:
@@ -804,6 +810,12 @@ class BotController:
                     # По умолчанию уже True в __init__, можно явно сохранить или оставить как есть
                     pass
 
+                # 2b. Воронка: сделки или только сигналы
+                cursor.execute("SELECT value FROM settings WHERE key = 'funnel_trading'")
+                row = cursor.fetchone()
+                if row:
+                    self.funnel_trading_enabled = row[0] == '1'
+
                 # 3. Notifications
                 cursor.execute("SELECT value FROM settings WHERE key = 'notifications_enabled'")
                 row = cursor.fetchone()
@@ -882,6 +894,46 @@ class BotController:
         
         logger.info(f"🔄 Режим изменён: {old_mode} → {mode}")
     
+    def is_funnel_trading_enabled(self) -> bool:
+        return self.funnel_trading_enabled
+
+    def toggle_funnel_trading(self) -> bool:
+        """Воронка: открывать сделки ⇄ только присылать сигналы."""
+        self.funnel_trading_enabled = not self.funnel_trading_enabled
+        try:
+            with db.transaction() as conn:
+                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                             ('funnel_trading', '1' if self.funnel_trading_enabled else '0'))
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения настроек: {e}")
+        logger.info(f"🔄 Воронка: {'сделки' if self.funnel_trading_enabled else 'только сигналы'}")
+        return self.funnel_trading_enabled
+
+    async def _funnel_signal_only(self, candidates: List[Dict]) -> None:
+        """Воронка в режиме «только сигналы»: записать и прислать лучший новый сигнал."""
+        from config import trading_config as _cfg
+        repo = entry_funnel_service.repo
+        for c in candidates:
+            repo.update(c.get('signal_id'), decision='SIGNAL', reason='только сигнал (сделки воронки выключены)')
+        self._note_signal("👀 воронка: только сигналы",
+                          f"кандидатов: {len(candidates)}" if candidates else "кандидатов нет")
+        now = time.time()
+        hold = float(getattr(_cfg, 'FUNNEL_SIGNAL_NOTIFY_HOURS', 6)) * 3600
+        for c in candidates:
+            pair = c['pair']
+            if now - self._signal_notified.get(pair, 0) < hold:
+                continue
+            self._signal_notified[pair] = now
+            plan = c['plan']
+            entry, stop = float(plan.entry), float(plan.stop)
+            target = float(getattr(plan, 'take_profit', 0) or 0)
+            line = f"👀 Сигнал воронки (без сделки): {pair} — балл {c['score']}/100, триггер {c['metrics'].get('trigger')}\n"
+            line += f"вход ~{entry:.6g}, стоп {stop:.6g} (−{(entry - stop) / entry * 100:.2f}%)"
+            if target:
+                line += f", цель {target:.6g}"
+            await self._send_notification(line)
+            break   # одно уведомление за цикл
+
     def is_auto_trading_enabled(self) -> bool:
         """Проверить, включена ли авто-торговля"""
         return self.auto_trading_enabled

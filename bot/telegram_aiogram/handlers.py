@@ -148,6 +148,9 @@ def _settings_kb(controller) -> InlineKeyboardBuilder:
     else:
         kb.button(text="⏸ Пауза (сопровождение позиций тоже)", callback_data="tg:pause")
     kb.button(text=f"🤖 Авто-торговля: {'ON' if auto else 'OFF'}", callback_data="tg:toggle_auto_trading")
+    if controller is not None and hasattr(controller, 'is_funnel_trading_enabled'):
+        ft = controller.is_funnel_trading_enabled()
+        kb.button(text=f"🧭 Воронка: {'сделки' if ft else 'только сигналы'}", callback_data="tg:toggle_funnel")
     if ENTRY_STRATEGY != "FUNNEL":
         kb.button(text=f"🔍 Сканер: {'ON' if scanner else 'OFF'}", callback_data="tg:toggle_scanner")
     kb.button(text=f"🔔 Уведомления: {'ON' if notif else 'OFF'}", callback_data="tg:toggle_notifications")
@@ -1331,6 +1334,10 @@ def create_router(controller=None) -> Router:
                 await _send_text_cb(callback, _format_settings_text(controller), reply_markup=_settings_kb(controller).as_markup())
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка: {e}", reply_markup=_settings_kb(controller).as_markup())
+        elif data == "tg:toggle_funnel":
+            if controller is not None and hasattr(controller, "toggle_funnel_trading"):
+                controller.toggle_funnel_trading()
+            await _send_text_cb(callback, _format_settings_text(controller), reply_markup=_settings_kb(controller).as_markup())
         elif data == "tg:toggle_scanner":
             if not controller or not hasattr(controller, "toggle_scanner"):
                 await _send_text_cb(callback, "❌ Недоступно", reply_markup=_settings_kb(controller).as_markup())

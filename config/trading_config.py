@@ -100,6 +100,13 @@ THRESHOLD_WAIT = 50              # сигнал WAIT при 50 <= score < 60
 # ИИ (Perplexity / DeepSeek / Groq / Ollama) из бота удалён в v2.3.
 ENTRY_STRATEGY = "FUNNEL"
 
+# v2.6.2: бэктест за год — воронка в минусе (−0.25R на walk-forward даже с фильтрами
+# отката и силы к BTC), тренд на 3 годах прошёл все критерии. Поэтому по умолчанию
+# воронка только присылает сигналы, сделки открывает трендовая стратегия.
+# Переключается в Telegram: ⚙️ Настройки → «🧭 Воронка».
+FUNNEL_TRADING_ENABLED = False
+FUNNEL_SIGNAL_NOTIFY_HOURS = 6         # не повторять сигнал по той же паре чаще
+
 # --- Шаг 1. Отбор пар (get_tickers spot + linear) ---
 FUNNEL_MIN_TURNOVER_USDT = 5_000_000   # мин. оборот спота за 24ч
 FUNNEL_MAX_SPREAD = 0.001              # макс. спред bid/ask (0.1%)

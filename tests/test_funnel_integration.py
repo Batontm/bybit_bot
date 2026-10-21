@@ -202,7 +202,7 @@ async def test_open_with_plan_not_filled_cancels(monkeypatch):
     assert all(kw['side'] == 'Buy' for _, kw in client.orders)  # никаких TP/SL
 
 
-async def _run_controller(monkeypatch, strategy='FUNNEL'):
+async def _run_controller(monkeypatch, strategy='FUNNEL', funnel_trading=True):
     from bot import controller as ctrl_module
     from bot.services.entry_funnel_service import entry_funnel_service
 
@@ -217,6 +217,7 @@ async def _run_controller(monkeypatch, strategy='FUNNEL'):
     ctrl = ctrl_module.BotController()
     ctrl.trading_service = trading
     ctrl.fixed_pairs = []
+    ctrl.funnel_trading_enabled = funnel_trading
     sent, analyzed = [], []
 
     async def fake_notify(msg):
@@ -238,6 +239,23 @@ async def test_controller_funnel_opens_position_without_ai(monkeypatch):
     assert any(kw['side'] == 'Buy' for _, kw in client.orders)
     assert sent and 'Балл воронки' in sent[0]
     assert analyzed == []  # воронка не зовёт никакой внешний анализ
+
+
+async def test_controller_funnel_signal_only_no_orders(monkeypatch):
+    client, sent, analyzed = await _run_controller(monkeypatch, funnel_trading=False)
+    assert client.orders == []                       # сделок нет
+    assert sent and 'Сигнал воронки (без сделки)' in sent[0]
+    assert 'стоп' in sent[0]
+
+
+def test_funnel_trading_default_off_and_toggle(monkeypatch):
+    from bot import controller as ctrl_module
+    from config import trading_config as cfg
+    assert cfg.FUNNEL_TRADING_ENABLED is False
+    ctrl = ctrl_module.BotController()
+    before = ctrl.is_funnel_trading_enabled()
+    assert ctrl.toggle_funnel_trading() is (not before)
+    ctrl.toggle_funnel_trading()
 
 
 def test_no_ai_modules_left():
