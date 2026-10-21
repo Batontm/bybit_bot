@@ -21,7 +21,24 @@ cd ~/Documents/bybit_bot
 
 ## Сервер
 
-> Старый сервер `217.12.37.42` больше не существует. Раздел ниже — для будущего сервера.
+Сервер: `root@72.56.237.179` (Ubuntu, есть IPv4 и IPv6). Установка и обновление — одним скриптом:
+
+```bash
+# на сервере, первый раз
+apt-get update && apt-get install -y git
+git clone -b feature/entry-funnel https://github.com/Batontm/bybit_bot /root/bybit_bot
+bash /root/bybit_bot/scripts/setup_server.sh      # без .env: всё поставит, службу не запустит
+
+# с Mac — ключи (в git их нет)
+scp ~/Documents/bybit_bot/.env root@72.56.237.179:/root/bybit_bot/.env
+
+# на сервере — проверка ключей и запуск службы bybit-bot; потом этой же командой обновлять код
+bash /root/bybit_bot/scripts/setup_server.sh
+```
+
+Перед запуском на сервере останови бота на Mac: два бота с одними ключами будут торговать параллельно.
+
+> Ниже — старая инструкция для сервера `217.12.37.42`, которого больше нет.
 
 ## Параметры
 - Сервер: `root@217.12.37.42:58291`
