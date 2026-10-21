@@ -66,6 +66,8 @@ class AiogramTelegramBot:
             await self.bot.set_my_commands([
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="health", description="Дашборд: баланс, позиции, риск"),
+                BotCommand(command="positions", description="Позиции и их закрытие"),
+                BotCommand(command="signals", description="Сигналы: последний проход воронки"),
                 BotCommand(command="regime", description="Светофор BTC 4H"),
                 BotCommand(command="pnl", description="Статистика PnL"),
                 BotCommand(command="arbitrage", description="Арбитраж"),

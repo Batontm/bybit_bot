@@ -441,14 +441,14 @@ class TradingService:
         Опрашивать ордер до исполнения/отмены. По таймауту отменить остаток.
         Returns: {status, filled_qty, avg_price, fee}
         """
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
         last: Dict = {}
         terminal = {'Filled', 'Cancelled', 'Rejected', 'PartiallyFilledCanceled', 'Deactivated'}
         while True:
             last = self._get_order(pair, order_id) or last
             if last.get('orderStatus') in terminal:
                 break
-            if asyncio.get_event_loop().time() >= deadline:
+            if asyncio.get_running_loop().time() >= deadline:
                 try:
                     self.client.cancel_order(category="spot", symbol=pair, orderId=order_id)
                     logger.info(f"⌛ {pair}: ордер {order_id} не исполнился за {timeout:.0f}с — отменён")

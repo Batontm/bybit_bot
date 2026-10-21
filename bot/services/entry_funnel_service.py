@@ -30,6 +30,8 @@ class EntryFunnelService:
         self.repo = EntrySignalsRepository()
         self._delist_cache: Tuple[float, set] = (0.0, set())
         self._kline_cache: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {}
+        # Итог последнего прохода — для экрана «🧭 Сигналы» в Telegram
+        self.last_scan: Optional[Dict] = None
 
     # ------------------------------------------------------------- data
 
@@ -115,11 +117,14 @@ class EntryFunnelService:
             linear = self._tickers("linear")  # нужен всегда: funding и наличие перпа
         except Exception as e:
             logger.error(f"❌ Воронка: не удалось получить тикеры: {e}")
+            self.last_scan = {'at': time.time(), 'error': f'нет тикеров Bybit: {e}'}
             return []
 
         universe = F.select_universe(spot, linear, always_include=always_include, exclude=exclude)
         if not universe:
             logger.info("ℹ️ Воронка: ни одна пара не прошла отбор по ликвидности/спреду")
+            self.last_scan = {'at': time.time(), 'universe': 0, 'trend': 0, 'trigger': 0,
+                              'candidates': [], 'near_misses': [], 'excluded': list(exclude)}
             return []
 
         btc_ticker = next((t for t in spot if t.get('symbol') == self.BTC), {})
@@ -128,6 +133,7 @@ class EntryFunnelService:
         delisted = self._delisted_bases()
 
         candidates: List[Dict] = []
+        scored: List[Dict] = []
         deep_checks = 0
         stats = {'universe': len(universe), 'trend': 0, 'trigger': 0}
 
@@ -145,6 +151,7 @@ class EntryFunnelService:
             if result['stage'] == 'scored':
                 stats['trigger'] += 1
                 deep_checks += 1
+                scored.append(result)
             if result.get('passed'):
                 candidates.append(result)
 
@@ -156,6 +163,23 @@ class EntryFunnelService:
         )
         for c in candidates[:3]:
             logger.info(f"   🎯 {c['pair']}: {c['score']} баллов {c['components']}")
+
+        def brief(r: Dict) -> Dict:
+            plan = r.get('plan')
+            return {
+                'pair': r['pair'], 'score': r.get('score'), 'components': r.get('components') or {},
+                'reasons': r.get('reasons') or [], 'trigger': (r.get('metrics') or {}).get('trigger'),
+                'stop_pct': plan.stop_pct if plan else None,
+                'tp_pct': ((plan.take_profit - plan.entry) / plan.entry) if plan else None,
+            }
+        near = sorted((r for r in scored if not r.get('passed')), key=lambda r: r.get('score') or 0, reverse=True)
+        self.last_scan = {
+            'at': time.time(), 'took': time.time() - t0,
+            'universe': stats['universe'], 'trend': stats['trend'], 'trigger': stats['trigger'],
+            'candidates': [brief(c) for c in candidates[:5]],
+            'near_misses': [brief(r) for r in near[:5]],
+            'excluded': list(exclude),
+        }
         return candidates
 
     def _evaluate(self, item: Dict, btc_4h: List[Dict], btc_change: float,
@@ -224,7 +248,7 @@ class EntryFunnelService:
             stop=plan.stop if plan else None, tp=plan.take_profit if plan else None,
         )
         return {
-            'pair': pair, 'stage': 'scored', 'passed': passed, 'score': fs.score,
+            'pair': pair, 'stage': 'scored', 'passed': passed, 'score': fs.score, 'reasons': reasons,
             'components': fs.components, 'vetoes': fs.vetoes, 'notes': fs.notes,
             'metrics': metrics, 'plan': plan, 'signal_id': signal_id,
         }

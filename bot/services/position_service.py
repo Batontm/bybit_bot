@@ -461,7 +461,7 @@ class PositionService:
         
         pair = position['pair']
         quantity = position['quantity']
-        entry_price = position['entry_price']
+        entry_price = position.get('avg_entry_price') or position['entry_price']
         
         try:
             await self._cancel_position_orders(position_id)
@@ -505,7 +505,7 @@ class PositionService:
                             logger.debug(f"Не удалось продать остаток: {e}")
                 
                 # Закрываем позицию в БД с приблизительным PnL
-                realized_pnl = (current_price - entry_price) * actual_balance
+                realized_pnl = self._record_manual_pnl(position, current_price, actual_balance)
                 self._close_position_with_pnl(position_id, pair, current_price, realized_pnl)
                 await self._cancel_position_orders(position_id)
                 return True
@@ -545,8 +545,8 @@ class PositionService:
                     logger.error(f"❌ Ошибка закрытия: {order_response['retMsg']}")
                     return False
             
-            # Расчёт PnL
-            realized_pnl = (current_price - entry_price) * quantity
+            # Расчёт PnL (вход по средней, комиссии: фактическая на входе + оценка 0.1% на выходе)
+            realized_pnl = self._record_manual_pnl(position, current_price, quantity)
             
             # Закрываем позицию с записью PnL
             self._close_position_with_pnl(position_id, pair, current_price, realized_pnl)
@@ -589,6 +589,21 @@ class PositionService:
             except Exception:
                 continue
         return False
+
+    def _record_manual_pnl(self, position: dict, exit_price: float, qty: float) -> float:
+        """PnL ручного/принудительного закрытия по рынку с учётом комиссий; пишет детализацию."""
+        entry = float(position.get('avg_entry_price') or position['entry_price'])
+        gross = (exit_price - entry) * qty
+        fees = float(position.get('commission_paid') or 0) + exit_price * qty * 0.001
+        net = gross - fees
+        try:
+            self.trades_repo.update_position_pnl_breakdown(
+                position['id'], commission_paid=fees, slippage=float(position.get('slippage') or 0),
+                gross_pnl=gross, net_pnl=net,
+            )
+        except Exception as e:
+            logger.debug(f"pnl breakdown {position.get('pair')}: {e}")
+        return net
 
     async def _cancel_position_orders(self, position_id: int) -> None:
         """Отменить все открытые ордера позиции"""

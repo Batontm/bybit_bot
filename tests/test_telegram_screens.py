@@ -76,10 +76,10 @@ class FakeArb:
                 'positions': [{'pair': 'BTCUSDT', 'spot_qty': 0.01, 'entry_price': 67000, 'accumulated_funding': -1.5}]}
 
     def scan_funding_rates(self):
-        return [{'pair': 'ETHUSDT', 'risk': '🟢', 'funding_pct': 0.012, 'apy': 13.1, 'mark_price': 2790.1,
-                 'funding_rate': 0.00012},
+        return [{'pair': 'ETHUSDT', 'risk': '🟢', 'funding_pct': 0.04, 'apy': 43.8, 'mark_price': 2790.1,
+                 'funding_rate': 0.0004, 'entry_ok': True, 'reason': 'окупится за 2.6 дн.'},
                 {'pair': 'X<Y>USDT', 'risk': '🔴', 'funding_pct': 0.001, 'apy': 1.0, 'mark_price': 0.0004321,
-                 'funding_rate': 0.00001}]
+                 'funding_rate': 0.00001, 'entry_ok': False, 'reason': 'не в whitelist <BTC/ETH>'}]
 
 
 class FakeRegime:
@@ -221,3 +221,70 @@ def test_every_button_has_handler(fakes):
     datas = set(re.findall(r'callback_data=f?"(tg:[^"{]+)', src + bot_src))
     missing = [d for d in datas if d not in exact and not any(d.startswith(p) for p in prefixes)]
     assert not missing, f"кнопки без обработчика: {missing}"
+
+
+# ----------------------------------------------------------------- новые экраны
+
+class FakeFunnel:
+    last_scan = {
+        'at': 1_800_000_000.0, 'took': 7.5, 'universe': 25, 'trend': 6, 'trigger': 2,
+        'candidates': [{'pair': 'SOLUSDT', 'score': 85, 'trigger': 'break_high',
+                        'components': {'trend_4h': 20, 'pullback_1h': 15, 'trigger_15m': 20, 'orderbook': -2,
+                                       'funding': 10, 'open_interest': 0},
+                        'reasons': [], 'stop_pct': 0.012, 'tp_pct': 0.03}],
+        'near_misses': [{'pair': 'XRPUSDT', 'score': 60, 'components': {}, 'reasons': ['балл 60 < 70'],
+                         'stop_pct': None, 'tp_pct': None}],
+        'excluded': [],
+    }
+
+
+def test_signals_screen(fakes, monkeypatch):
+    import sys, types
+    fake_mod = types.SimpleNamespace(entry_funnel_service=FakeFunnel())
+    monkeypatch.setitem(sys.modules, 'bot.services.entry_funnel_service', fake_mod)
+    c = FakeController()
+    c.last_signal_check = {'at': 1_800_000_000.0, 'status': '🔴 светофор красный',
+                           'detail': 'close=1 <= EMA200 & RSI'}
+    t = H._format_signals(c)
+    assert_tg_html(t)
+    assert "светофор красный" in t and "&lt;=" in t
+    assert "Тренд 4h: <code>6</code>" in t and "SOL" in t and "SL −1.20% TP +3.00%" in t
+    assert "стакан -2" in t and "OI 0" not in t   # нулевые компоненты скрыты
+    assert "XRP — 60" in t
+
+
+def test_signals_screen_before_first_run(fakes, monkeypatch):
+    import sys, types
+    monkeypatch.setitem(sys.modules, 'bot.services.entry_funnel_service',
+                        types.SimpleNamespace(entry_funnel_service=types.SimpleNamespace(last_scan=None)))
+    t = H._format_signals(FakeController())
+    assert_tg_html(t)
+    assert "Проверок ещё не было" in t
+
+
+def test_positions_screen_has_close_buttons(fakes):
+    text, kb = H._positions_view()
+    assert_tg_html(text)
+    assert "Закрытие — по рынку" in text
+    buttons = [b for row in kb.as_markup().inline_keyboard for b in row]
+    assert [b.callback_data for b in buttons if b.text.startswith("❌")] == ["tg:close_ask:1", "tg:close_ask:2"]
+    assert any(b.text == "❌ Закрыть PEPE" for b in buttons)
+
+
+def test_close_confirm(fakes, monkeypatch):
+    monkeypatch.setattr(H.TradesRepository, 'get_position_by_id',
+                        staticmethod(lambda pid: dict(POSITIONS[0], status='OPEN')))
+    text, kb = H._close_confirm_view(1)
+    assert_tg_html(text)
+    assert "Закрыть ETH по рынку?" in text and "+1.47%" in text
+    monkeypatch.setattr(H.TradesRepository, 'get_position_by_id',
+                        staticmethod(lambda pid: dict(POSITIONS[0], status='CLOSED')))
+    text, kb = H._close_confirm_view(1)
+    assert "уже закрыта" in text
+
+
+def test_arbitrage_scan_shows_reason(fakes):
+    text, opps = H._format_arbitrage_analysis(10, position_size=100)
+    assert_tg_html(text)
+    assert "✅ окупится за 2.6 дн." in text
+    assert "не в whitelist &lt;BTC/ETH&gt;" in text

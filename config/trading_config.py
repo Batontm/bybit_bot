@@ -171,8 +171,15 @@ ERROR_BUFFER_SIZE = 200          # размер кольцевого буфер�
 # ============= AUTO ARBITRAGE (спот-фьючерс) =============
 ARBITRAGE_ENABLED = True         # Включить авто-арбитраж
 ARBITRAGE_CHECK_INTERVAL = 3600  # Проверка возможностей каждый час (секунды)
-ARBITRAGE_MIN_FUNDING_RATE = 0.0001  # Минимальный funding rate (0.01%)
-ARBITRAGE_MAX_POSITIONS = 3      # Максимум арбитражных позиций
+ARBITRAGE_MIN_FUNDING_RATE = 0.0001  # Минимальный funding rate (0.01%) — нижняя граница
+ARBITRAGE_MAX_POSITIONS = 2      # Максимум арбитражных позиций (whitelist — только BTC и ETH)
+# Комиссии полного круга: спот купить+продать (taker 0.1% × 2) + перп открыть+закрыть (taker 0.055% × 2)
+ARBITRAGE_FEE_ROUNDTRIP = 0.0031
+# Вход, только если funding окупает комиссии не дольше чем за N дней (3 начисления в сутки).
+# При 3 днях нужен funding ≥ 0.0031 / 9 ≈ 0.034% за 8 часов.
+ARBITRAGE_MAX_BREAKEVEN_DAYS = 3.0
+# Выход: если N последних начисленных funding подряд отрицательные (шорт платит)
+ARBITRAGE_EXIT_NEGATIVE_PERIODS = 2
 ARBITRAGE_POSITION_SIZE_USD = 100  # Размер позиции в USDT
 ARBITRAGE_FUNDING_UPDATE_HOURS = 8  # Обновление funding каждые 8 часов
 ARBITRAGE_MIN_VOLUME_USDT = 10_000_000  # Мин. объем торгов за 24ч для пары
@@ -181,7 +188,7 @@ ARBITRAGE_SCAN_LIMIT = 50           # Сколько топ-ликвидных �
 # Усиление авто-арбитража в «красном» режиме (когда новые сделки запрещены Светофором)
 # Идея: деньги не простаивают, а работают в market-neutral funding arbitrage.
 ARBITRAGE_RED_MODE_ENABLED = True
-ARBITRAGE_RED_MAX_POSITIONS = 8
+ARBITRAGE_RED_MAX_POSITIONS = 2  # whitelist — только BTC и ETH, больше 2 позиций не бывает
 # Максимальная доля стейбл-депозита (USDT+USDC), которая может быть задействована в арбитраже
 ARBITRAGE_RED_TOTAL_ALLOCATION_PCT = 0.30
 # Минимальный размер одной арбитражной позиции (защита от микросделок)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import time
 from typing import Optional
 
 from aiogram import Router
@@ -18,6 +20,18 @@ from bot.controller import BOT_VERSION
 from bot.services.balance_service import balance_service
 from bot.services.arbitrage_service import arbitrage_service
 from bot.services.market_regime_service import market_regime_service
+
+
+async def _bg(fn, *args):
+    """Синхронный код с запросами к бирже — в отдельном потоке, чтобы бот не «замирал»."""
+    return await asyncio.to_thread(fn, *args)
+
+
+async def _exchange(controller, coro_fn, *args):
+    """Торговое действие — в поток биржи (по очереди с задачами бота), если он есть."""
+    if controller is not None and hasattr(controller, "run_exchange"):
+        return await controller.run_exchange(coro_fn, *args)
+    return await coro_fn(*args)
 
 
 def _price(v: float) -> str:
@@ -91,13 +105,15 @@ def _is_allowed_callback(callback: CallbackQuery) -> bool:
 def _main_menu_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Дашборд", callback_data="tg:health")
+    kb.button(text="📂 Позиции", callback_data="tg:positions")
+    kb.button(text="🧭 Сигналы", callback_data="tg:signals")
     kb.button(text="🚦 Режим", callback_data="tg:regime")
     kb.button(text="📈 PnL", callback_data="tg:pnl")
     kb.button(text="💹 Арбитраж", callback_data="tg:arbitrage")
     kb.button(text="⚙️ Настройки", callback_data="tg:settings")
     kb.button(text="🛠 Сервис", callback_data="tg:service")
     kb.button(text="🛑 PANIC SELL", callback_data="tg:panic_confirm")
-    kb.adjust(2, 2, 2, 1)
+    kb.adjust(1, 2, 2, 2, 2)
     return kb
 
 
@@ -538,6 +554,9 @@ def _format_arbitrage_analysis(limit: int = 10, position_size: float = 0) -> tup
 
         lines = ["💹 <b>Арбитраж: анализ funding</b>"]
         lines.append(f"Размер позиции: <b>${position_size:.0f}</b> (3% депозита ≈ ${_get_default_arb_size():.0f})")
+        min_fr = float(getattr(arbitrage_service, "MIN_FUNDING_RATE", 0.0001))
+        lines.append(f"Вход: только BTC/ETH и funding ≥ <code>{min_fr * 100:.4f}%</code> "
+                     f"(комиссии полного круга ≈0.31% окупаются ≤ 3 дн.)")
         lines.append("")
 
         shown = opps[: max(1, int(limit))]
@@ -549,9 +568,8 @@ def _format_arbitrage_analysis(limit: int = 10, position_size: float = 0) -> tup
             apy = float(o.get("apy") or 0)
             mark = float(o.get("mark_price") or 0)
 
-            # Разрешаем вход только если funding не ниже MIN_FUNDING_RATE сервиса
-            allowed = float(o.get("funding_rate") or 0) >= float(getattr(arbitrage_service, "MIN_FUNDING_RATE", 0.0001))
-            can = "✅ можно" if allowed else "⛔️ нельзя"
+            allowed = bool(o.get("entry_ok"))
+            can = ("✅ " if allowed else "⛔️ ") + html.escape(str(o.get("reason") or ""))
             lines.append(f"- {html.escape(str(risk))} <b>{html.escape(str(pair))}</b> | funding={fr_pct:.4f}% | APY≈{apy:.1f}% | цена {_price(mark)} | {can}")
 
         return "\n".join(lines), shown
@@ -563,7 +581,19 @@ def _format_arbitrage_analysis(limit: int = 10, position_size: float = 0) -> tup
 _arb_user_size: dict[int, float] = {}  # user_id -> selected size in USD
 
 
+_arb_default_cache: list = [0.0, 0.0]  # [timestamp, value]
+
+
 def _get_default_arb_size() -> float:
+    """3% депозита (кэш 60 с — раньше каждая кнопка заново запрашивала баланс)."""
+    if time.time() - _arb_default_cache[0] < 60 and _arb_default_cache[1] > 0:
+        return _arb_default_cache[1]
+    value = _calc_default_arb_size()
+    _arb_default_cache[0], _arb_default_cache[1] = time.time(), value
+    return value
+
+
+def _calc_default_arb_size() -> float:
     """3% of total deposit, minimum $50, fallback to config value."""
     try:
         grand_total = _total_equity_usd(balance_service.get_all_balances() or [])
@@ -618,8 +648,7 @@ def _arbitrage_analysis_kb(opps: list[dict], position_size: float = 0) -> Inline
         pair = o.get("pair")
         if not pair:
             continue
-        allowed = float(o.get("funding_rate") or 0) >= float(getattr(arbitrage_service, "MIN_FUNDING_RATE", 0.0001))
-        if not allowed:
+        if not o.get("entry_ok"):
             continue
         kb.button(text=f"▶️ Войти: {pair}", callback_data=f"tg:arb_open:{pair}")
         count += 1
@@ -701,6 +730,158 @@ def _format_today_pnl() -> str:
         return ""
 
 
+# ----------------------------------------------------------------- 🧭 Сигналы
+
+_COMPONENT_NAMES = {
+    'trend_4h': 'тренд', 'pullback_1h': 'откат', 'trigger_15m': 'триггер',
+    'relative_strength': 'сила к BTC', 'orderbook': 'стакан', 'aggressor': 'покупки',
+    'open_interest': 'OI', 'funding': 'funding', 'crowd': 'толпа',
+}
+
+
+def _ago(ts: Optional[float]) -> str:
+    if not ts:
+        return "—"
+    from datetime import datetime
+    from config.settings import TIMEZONE
+    mins = int(max(0, time.time() - ts) // 60)
+    hhmm = datetime.fromtimestamp(ts, TIMEZONE).strftime("%H:%M")
+    return f"{hhmm} ({'только что' if mins == 0 else f'{mins} мин назад'})"
+
+
+def _components_txt(comp: dict) -> str:
+    parts = [f"{_COMPONENT_NAMES.get(k, k)} {v:+d}" if v < 0 else f"{_COMPONENT_NAMES.get(k, k)} {v}"
+             for k, v in comp.items() if v]
+    return ", ".join(parts) or "—"
+
+
+def _format_signals(controller) -> str:
+    from config.trading_config import SIGNAL_CHECK_INTERVAL, FUNNEL_MIN_SCORE
+    lines = ["🧭 <b>Сигналы — поиск входов</b>"]
+
+    check = getattr(controller, 'last_signal_check', None) if controller is not None else None
+    if check:
+        lines.append(f"Последняя проверка: {_ago(check.get('at'))} — <b>{html.escape(str(check.get('status', '')))}</b>")
+        if check.get('detail'):
+            lines.append(f"<i>{html.escape(str(check['detail']))[:300]}</i>")
+    else:
+        lines.append("Проверок ещё не было (первая — через несколько минут после запуска)")
+    lines.append(f"Проверка каждые {SIGNAL_CHECK_INTERVAL // 60} мин | стратегия <code>{ENTRY_STRATEGY}</code>")
+
+    if ENTRY_STRATEGY != "FUNNEL":
+        return "\n".join(lines)
+
+    try:
+        from bot.services.entry_funnel_service import entry_funnel_service
+        scan = entry_funnel_service.last_scan
+    except Exception:
+        scan = None
+
+    lines.append("")
+    if not scan:
+        lines.append("Воронка ещё не запускалась (светофор, пауза или риск-лимит не пускают дальше).")
+    elif scan.get('error'):
+        lines.append(f"⚠️ Последний проход воронки: {_ago(scan.get('at'))} — {html.escape(scan['error'])}")
+    else:
+        lines.append(f"<b>Последний проход воронки:</b> {_ago(scan.get('at'))}, {scan.get('took', 0):.0f} с")
+        lines.append(f"├ Отбор по ликвидности и спреду: <code>{scan.get('universe', 0)}</code>")
+        lines.append(f"├ Тренд 4h: <code>{scan.get('trend', 0)}</code>")
+        lines.append(f"├ Триггер 15m: <code>{scan.get('trigger', 0)}</code>")
+        lines.append(f"└ Балл ≥ {FUNNEL_MIN_SCORE} без вето: <code>{len(scan.get('candidates') or [])}</code>")
+
+        cands = scan.get('candidates') or []
+        if cands:
+            lines.append("")
+            lines.append("🎯 <b>Кандидаты:</b>")
+            for c in cands:
+                coin = html.escape(c['pair'].replace('USDT', ''))
+                risk = ""
+                if c.get('stop_pct') is not None and c.get('tp_pct') is not None:
+                    risk = f" | SL −{c['stop_pct'] * 100:.2f}% TP +{c['tp_pct'] * 100:.2f}%"
+                lines.append(f"• <b>{coin}</b> — {c.get('score')}{risk}")
+                lines.append(f"   {html.escape(_components_txt(c.get('components') or {}))}")
+
+        near = scan.get('near_misses') or []
+        if near:
+            lines.append("")
+            lines.append("〰️ <b>Дошли до оценки, но не прошли:</b>")
+            for c in near:
+                coin = html.escape(c['pair'].replace('USDT', ''))
+                why = html.escape("; ".join(c.get('reasons') or [])[:120])
+                lines.append(f"• {coin} — {c.get('score')}: {why}")
+
+    try:
+        from bot.db.connection import get_db
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT created_at, pair, score, decision, reason FROM entry_signals "
+                "WHERE stage = 'scored' ORDER BY id DESC LIMIT 6"
+            ).fetchall()
+        if rows:
+            icons = {'OPENED': '✅', 'CANDIDATE': '🎯', 'SKIP': '➖', 'FAILED': '⚠️', 'AI_VETO': '🤖'}
+            lines.append("")
+            lines.append("🗂 <b>Последние оценки:</b>")
+            for r in rows:
+                t = str(r['created_at'])[11:16]
+                coin = html.escape(str(r['pair']).replace('USDT', ''))
+                lines.append(f"{icons.get(r['decision'], '•')} {t} {coin} {r['score']} — "
+                             f"{html.escape(str(r['reason'] or ''))[:80]}")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def _signals_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Обновить", callback_data="tg:signals")
+    kb.button(text="⬅️ Меню", callback_data="tg:menu")
+    kb.adjust(2)
+    return kb
+
+
+# ----------------------------------------------------------------- 📂 Позиции
+
+def _positions_view() -> tuple[str, InlineKeyboardBuilder]:
+    text = _format_open_positions_block(max_rows=10)
+    kb = InlineKeyboardBuilder()
+    try:
+        positions = TradesRepository.get_open_positions()
+    except Exception:
+        positions = []
+    for p in positions[:10]:
+        coin = str(p.get('pair') or '').replace('USDT', '')
+        kb.button(text=f"❌ Закрыть {coin}", callback_data=f"tg:close_ask:{p['id']}")
+    kb.button(text="🔄 Обновить", callback_data="tg:positions")
+    kb.button(text="⬅️ Меню", callback_data="tg:menu")
+    kb.adjust(*([2] * ((len(positions[:10]) + 1) // 2)), 2)
+    if positions:
+        text += "\n\n<i>Закрытие — по рынку, с отменой TP/SL этой позиции.</i>"
+    return text, kb
+
+
+def _close_confirm_view(position_id: int) -> tuple[str, InlineKeyboardBuilder]:
+    kb = InlineKeyboardBuilder()
+    p = TradesRepository.get_position_by_id(position_id)
+    if not p or p.get('status') != 'OPEN':
+        kb.button(text="📂 Позиции", callback_data="tg:positions")
+        return "ℹ️ Позиция уже закрыта.", kb
+    coin = html.escape(str(p['pair']).replace('USDT', ''))
+    entry = float(p.get('avg_entry_price') or p.get('entry_price') or 0)
+    cur = float(p.get('current_price') or entry)
+    qty = float(p.get('quantity') or 0)
+    pnl = (cur - entry) * qty
+    pct = (cur - entry) / entry * 100 if entry else 0
+    text = (f"❓ <b>Закрыть {coin} по рынку?</b>\n\n"
+            f"Количество: <code>{_qty(qty)}</code>\n"
+            f"Вход {_price(entry)} → сейчас {_price(cur)}\n"
+            f"PnL сейчас: <b>{pct:+.2f}% ({_usd(pnl, sign=True)})</b> без учёта комиссий")
+    kb.button(text=f"✅ Да, закрыть {coin}", callback_data=f"tg:close_do:{position_id}")
+    kb.button(text="❌ Отмена", callback_data="tg:positions")
+    kb.adjust(1)
+    return text, kb
+
+
 def _pnl_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 PnL: всё время", callback_data="tg:pnl:all")
@@ -741,14 +922,14 @@ def create_router(controller=None) -> Router:
         if not _is_allowed_message(message):
             return
         kb = _main_menu_kb()
-        await _send_text(message, _format_health(controller), reply_markup=kb.as_markup())
+        await _send_text(message, await _bg(_format_health, controller), reply_markup=kb.as_markup())
 
     @router.message(Command("regime"))
     async def cmd_regime(message: Message) -> None:
         if not _is_allowed_message(message):
             return
         kb = _main_menu_kb()
-        await _send_text(message, _format_regime(), reply_markup=kb.as_markup())
+        await _send_text(message, await _bg(_format_regime), reply_markup=kb.as_markup())
 
     @router.message(Command("errors"))
     async def cmd_errors(message: Message) -> None:
@@ -772,13 +953,13 @@ def create_router(controller=None) -> Router:
     async def cmd_pnl(message: Message) -> None:
         if not _is_allowed_message(message):
             return
-        await _send_text(message, _format_pnl_summary(7), reply_markup=_pnl_kb().as_markup())
+        await _send_text(message, await _bg(_format_pnl_summary, 7), reply_markup=_pnl_kb().as_markup())
 
     @router.message(Command("arbitrage"))
     async def cmd_arbitrage(message: Message) -> None:
         if not _is_allowed_message(message):
             return
-        await _send_text(message, _format_arbitrage_dashboard(), reply_markup=_arbitrage_dashboard_kb().as_markup())
+        await _send_text(message, await _bg(_format_arbitrage_dashboard), reply_markup=_arbitrage_dashboard_kb().as_markup())
 
     @router.message(Command("reconcile"))
     async def cmd_reconcile(message: Message) -> None:
@@ -790,10 +971,23 @@ def create_router(controller=None) -> Router:
             return
         await _send_text(message, "🔁 Запускаю reconciliation...", reply_markup=kb.as_markup())
         try:
-            await controller._reconcile_orphan_orders()
+            await _exchange(controller, controller._reconcile_orphan_orders)
             await _send_text(message, "✅ Reconcile завершён", reply_markup=kb.as_markup())
         except Exception as e:
             await _send_text(message, f"❌ Ошибка reconcile: {e}", reply_markup=kb.as_markup())
+
+    @router.message(Command("signals"))
+    async def cmd_signals(message: Message) -> None:
+        if not _is_allowed_message(message):
+            return
+        await _send_text(message, await _bg(_format_signals, controller), reply_markup=_signals_kb().as_markup())
+
+    @router.message(Command("positions"))
+    async def cmd_positions(message: Message) -> None:
+        if not _is_allowed_message(message):
+            return
+        text, pkb = await _bg(_positions_view)
+        await _send_text(message, text, reply_markup=pkb.as_markup())
 
     @router.message(Command("settings"))
     async def cmd_settings(message: Message) -> None:
@@ -830,9 +1024,9 @@ def create_router(controller=None) -> Router:
         kb = _main_menu_kb().as_markup()
 
         if data == "tg:health":
-            await _send_text_cb(callback, _format_health(controller), reply_markup=kb)
+            await _send_text_cb(callback, await _bg(_format_health, controller), reply_markup=kb)
         elif data == "tg:regime":
-            await _send_text_cb(callback, _format_regime(), reply_markup=kb)
+            await _send_text_cb(callback, await _bg(_format_regime), reply_markup=kb)
         elif data == "tg:menu":
             await _send_text_cb(
                 callback,
@@ -859,7 +1053,7 @@ def create_router(controller=None) -> Router:
                 return
             await _send_text_cb(callback, "🔁 Запускаю сверку ордеров...", reply_markup=srv_kb)
             try:
-                await controller._reconcile_orphan_orders()
+                await _exchange(controller, controller._reconcile_orphan_orders)
                 await _send_text_cb(callback, "✅ Сверка завершена", reply_markup=srv_kb)
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка: {e}", reply_markup=srv_kb)
@@ -881,7 +1075,7 @@ def create_router(controller=None) -> Router:
             await _send_pre_blocks_cb(callback, blocks)
             await _send_text_cb(callback, "📋 Логи отправлены", reply_markup=_service_kb().as_markup())
         elif data == "tg:pnl":
-            await _send_text_cb(callback, _format_pnl_summary(7), reply_markup=_pnl_kb().as_markup())
+            await _send_text_cb(callback, await _bg(_format_pnl_summary, 7), reply_markup=_pnl_kb().as_markup())
         elif data.startswith("tg:pnl:"):
             period = data.split(":", 2)[2] if ":" in data else "7"
             if period == "all":
@@ -891,17 +1085,20 @@ def create_router(controller=None) -> Router:
                     days = int(period)
                 except Exception:
                     days = 7
-            await _send_text_cb(callback, _format_pnl_summary(days), reply_markup=_pnl_kb().as_markup())
+            await _send_text_cb(callback, await _bg(_format_pnl_summary, days), reply_markup=_pnl_kb().as_markup())
         elif data == "tg:arbitrage":
-            await _send_text_cb(callback, _format_arbitrage_dashboard(), reply_markup=_arbitrage_dashboard_kb().as_markup())
+            await _send_text_cb(callback, await _bg(_format_arbitrage_dashboard), reply_markup=_arbitrage_dashboard_kb().as_markup())
         elif data == "tg:arb_scan":
             uid = callback.from_user.id if callback.from_user else 0
-            size = _get_arb_size(uid)
-            text, opps = _format_arbitrage_analysis(10, position_size=size)
-            await _send_text_cb(callback, text, reply_markup=_arbitrage_analysis_kb(opps, position_size=size).as_markup())
+            def _view():
+                size = _get_arb_size(uid)
+                text, opps = _format_arbitrage_analysis(10, position_size=size)
+                return text, _arbitrage_analysis_kb(opps, position_size=size).as_markup()
+            text, markup = await _bg(_view)
+            await _send_text_cb(callback, text, reply_markup=markup)
         elif data == "tg:arb_size_menu":
             uid = callback.from_user.id if callback.from_user else 0
-            size = _get_arb_size(uid)
+            size = await _bg(_get_arb_size, uid)
             default = _get_default_arb_size()
             text = (f"💰 <b>Размер позиции арбитража</b>\n\n"
                     f"Текущий: <b>${size:.0f}</b>\n"
@@ -917,7 +1114,7 @@ def create_router(controller=None) -> Router:
                 _arb_user_size[uid] = new_size
             except Exception:
                 pass
-            size = _get_arb_size(uid)
+            size = await _bg(_get_arb_size, uid)
             default = _get_default_arb_size()
             text = (f"💰 <b>Размер позиции арбитража</b>\n\n"
                     f"✅ Установлен: <b>${size:.0f}</b>\n"
@@ -930,14 +1127,14 @@ def create_router(controller=None) -> Router:
                 await _send_text_cb(callback, "❌ Не удалось определить пару", reply_markup=kb)
                 return
             uid = callback.from_user.id if callback.from_user else 0
-            size = _get_arb_size(uid)
+            size = await _bg(_get_arb_size, uid)
             await _send_text_cb(callback, f"▶️ Открываю арбитраж {html.escape(pair)} на <b>${size:.0f}</b>...", reply_markup=kb)
             try:
-                ok, msg = await arbitrage_service.open_arbitrage(pair, size)
+                ok, msg = await _exchange(controller, arbitrage_service.open_arbitrage, pair, size)
                 prefix = "✅" if ok else "❌"
                 await _send_text_cb(callback, f"{prefix} {html.escape(msg)}", reply_markup=kb)
                 if ok:
-                    await _send_text_cb(callback, _format_arbitrage_pnl_summary(), reply_markup=kb)
+                    await _send_text_cb(callback, await _bg(_format_arbitrage_pnl_summary), reply_markup=kb)
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка открытия арбитража: {html.escape(str(e))}", reply_markup=kb)
         elif data == "tg:toggle_notifications":
@@ -976,6 +1173,46 @@ def create_router(controller=None) -> Router:
                 await _send_text_cb(callback, _format_settings_text(controller), reply_markup=_settings_kb(controller).as_markup())
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка: {e}", reply_markup=_settings_kb(controller).as_markup())
+        elif data == "tg:signals":
+            await _send_text_cb(callback, await _bg(_format_signals, controller), reply_markup=_signals_kb().as_markup())
+        elif data == "tg:positions":
+            text, pkb = await _bg(_positions_view)
+            await _send_text_cb(callback, text, reply_markup=pkb.as_markup())
+        elif data.startswith("tg:close_ask:"):
+            try:
+                pid = int(data.split(":")[2])
+            except Exception:
+                return
+            text, ckb = await _bg(_close_confirm_view, pid)
+            await _send_text_cb(callback, text, reply_markup=ckb.as_markup())
+        elif data.startswith("tg:close_do:"):
+            try:
+                pid = int(data.split(":")[2])
+            except Exception:
+                return
+            p = await _bg(TradesRepository.get_position_by_id, pid)
+            back = InlineKeyboardBuilder()
+            back.button(text="📂 Позиции", callback_data="tg:positions")
+            back.button(text="⬅️ Меню", callback_data="tg:menu")
+            if not p or p.get('status') != 'OPEN':
+                await _send_text_cb(callback, "ℹ️ Позиция уже закрыта.", reply_markup=back.as_markup())
+                return
+            coin = html.escape(str(p['pair']).replace('USDT', ''))
+            await _send_text_cb(callback, f"⏳ Закрываю {coin}...")
+            from bot.services.position_service import position_service
+            try:
+                ok = await _exchange(controller, position_service.close_position, pid, "manual_telegram")
+            except Exception:
+                ok = False
+            after = await _bg(TradesRepository.get_position_by_id, pid)
+            if ok and after and after.get('status') == 'CLOSED':
+                pnl = float(after.get('net_pnl') or after.get('realized_pnl') or 0)
+                text = (f"✅ <b>{coin} закрыта</b> @ {_price(float(after.get('current_price') or 0))}\n"
+                        f"PnL: <b>{_usd(pnl, sign=True)}</b> (с оценкой комиссий)")
+            else:
+                text = (f"⚠️ Не удалось закрыть {coin}. Подробности — в «🛠 Сервис → ⚠️ Лог ошибок». "
+                        f"Можно повторить или закрыть вручную на Bybit.")
+            await _send_text_cb(callback, text, reply_markup=back.as_markup())
         elif data in ("tg:pause", "tg:resume"):
             if controller is None or not hasattr(controller, "set_mode"):
                 await _send_text_cb(callback, "❌ Недоступно", reply_markup=kb)
@@ -1004,7 +1241,8 @@ def create_router(controller=None) -> Router:
                 return
             await _send_text_cb(callback, "🛑 Выполняю PANIC SELL...", reply_markup=kb)
             try:
-                results = await controller.panic_sell_all()
+                # отдельный поток: не ждём очереди торговых задач — паника важнее
+                results = await asyncio.to_thread(lambda: asyncio.run(controller.panic_sell_all()))
                 await _send_text_cb(callback, "\n".join(results), reply_markup=kb)
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка panic sell: {e}", reply_markup=kb)

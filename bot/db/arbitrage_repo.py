@@ -32,6 +32,10 @@ class ArbitrageRepository:
                     notes TEXT
                 )
             """)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(arbitrage_positions)").fetchall()}
+            if 'last_funding_ts' not in cols:
+                # время последнего учтённого начисления funding (мс), чтобы не считать дважды
+                conn.execute("ALTER TABLE arbitrage_positions ADD COLUMN last_funding_ts INTEGER DEFAULT 0")
             logger.info("✅ Таблица arbitrage_positions готова")
     
     @staticmethod
@@ -102,6 +106,23 @@ class ArbitrageRepository:
             """, (funding_amount, position_id))
             logger.debug(f"💰 Funding обновлён: +{funding_amount:.4f} для позиции #{position_id}")
     
+    @staticmethod
+    def add_settled_funding(position_id: int, amount: float, periods: int, last_ts: int) -> None:
+        """Добавить фактически начисленный funding за `periods` начислений."""
+        with get_transaction() as conn:
+            conn.execute("""
+                UPDATE arbitrage_positions
+                SET accumulated_funding = accumulated_funding + ?,
+                    funding_count = funding_count + ?,
+                    last_funding_ts = ?
+                WHERE id = ?
+            """, (amount, periods, last_ts, position_id))
+
+    @staticmethod
+    def set_note(position_id: int, note: str) -> None:
+        with get_transaction() as conn:
+            conn.execute("UPDATE arbitrage_positions SET notes = ? WHERE id = ?", (note[:500], position_id))
+
     @staticmethod
     def close_position(position_id: int, realized_pnl: float) -> None:
         """Закрыть арбитражную позицию"""

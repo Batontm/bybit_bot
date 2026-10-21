@@ -2,7 +2,9 @@
 Главный контроллер бота - управление циклами и планировщиком
 """
 import asyncio
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -45,13 +47,21 @@ class BotController:
     def __init__(self):
         self.scheduler = AsyncIOScheduler(timezone=TIMEZONE)
         self.mode = "ACTIVE"  # ACTIVE, RISK_ONLY, PAUSED
+        self.pause_reason: str = ""  # panic / manual — пауза снимается только вручную
+        self.last_signal_check: Dict | None = None
         self.auto_trading_enabled = True
         self.scanner_enabled = False  # По умолчанию выключен
         self.started_at: datetime = datetime.now(TIMEZONE)
 
         # Подсистемы
         self.notifier = NotificationDispatcher()
-        self.slippage_guard = SlippageGuard(notifier=self.notifier.send)
+        self.slippage_guard = SlippageGuard(notifier=self._send_notification)
+
+        # Все операции, которые торгуют и меняют позиции, выполняются по очереди
+        # в одном отдельном потоке: сетевые запросы к Bybit (до 10 с на ответ)
+        # больше не блокируют Telegram и планировщик, а задачи не мешают друг другу.
+        self._exchange_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="exchange")
+        self._main_loop: asyncio.AbstractEventLoop | None = None
 
         # Сервисы
         self.trading_service = trading_service
@@ -99,7 +109,50 @@ class BotController:
     # -------- thin delegates (sane backward-compat) --------
 
     async def _send_notification(self, message: str) -> None:
-        await self.notifier.send(message)
+        """Отправить уведомление из любого потока: Telegram живёт в основном цикле."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if self._main_loop is not None and loop is not self._main_loop and self._main_loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(self.notifier.send(message), self._main_loop)
+            await asyncio.wrap_future(fut)
+        else:
+            await self.notifier.send(message)
+
+    # -------- фоновое выполнение --------
+
+    # Задачи, которые только читают рынок и сами вызывают run_exchange для сделок
+    _THREAD_JOBS = frozenset({'_check_signals'})
+
+    @staticmethod
+    def _in_exchange_worker() -> bool:
+        return threading.current_thread().name.startswith("exchange")
+
+    async def run_exchange(self, coro_fn, *args, **kwargs):
+        """
+        Выполнить корутину сервиса в потоке биржи (по очереди с остальными
+        торговыми задачами). Внутри самого потока — выполнить сразу (без дедлока).
+        """
+        if self._in_exchange_worker():
+            return await coro_fn(*args, **kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._exchange_pool, lambda: asyncio.run(coro_fn(*args, **kwargs)))
+
+    async def run_job(self, method_name: str) -> None:
+        """Точка входа планировщика: задача уходит в фоновый поток, цикл остаётся свободным."""
+        fn = getattr(self, method_name)
+        t0 = time.monotonic()
+        try:
+            if method_name in self._THREAD_JOBS:
+                await asyncio.to_thread(lambda: asyncio.run(fn()))
+            else:
+                await self.run_exchange(fn)
+        except Exception as e:
+            logger.error(f"❌ Задача {method_name}: {e}")
+        took = time.monotonic() - t0
+        if took > 20:
+            logger.warning(f"🐢 Задача {method_name} выполнялась {took:.0f} с")
 
     @staticmethod
     def _is_alert_message(message: str) -> bool:
@@ -121,6 +174,8 @@ class BotController:
         """Запустить контроллер и планировщик"""
         logger.info("🚀 Запуск контроллера...")
         
+        self._main_loop = asyncio.get_running_loop()
+
         # Получаем настройки сканера из БД
         self._load_settings()
         
@@ -137,7 +192,7 @@ class BotController:
         
         # Сразу запускаем сканер если он включен
         if self.scanner_enabled:
-            asyncio.create_task(self._update_market_pairs())
+            asyncio.create_task(self.run_job('_update_market_pairs'))
             
         logger.info("✅ Контроллер запущен")
     
@@ -149,7 +204,9 @@ class BotController:
         
         # Проверяем, что scheduler запущен перед остановкой
         if self.scheduler.running:
-            self.scheduler.shutdown(wait=True)
+            self.scheduler.shutdown(wait=False)
+        # Текущая задача в потоке биржи доработает сама, очередь отбрасываем
+        self._exchange_pool.shutdown(wait=False, cancel_futures=True)
         
         # Закрываем подключение к БД
         db.close()
@@ -170,18 +227,22 @@ class BotController:
 
         # 1. Пауза бота
         self.mode = "PAUSED"
+        self.pause_reason = "panic"
         self.auto_trading_enabled = False
         messages.append("⏸️ Бот переведён в PAUSED")
 
         # 2. Отмена всех ордеров на бирже
-        try:
-            resp = self.position_service.client.cancel_all_orders(category="spot")
-            if resp.get('retCode') == 0:
-                messages.append("✅ Все спот-ордера отменены")
-            else:
-                messages.append(f"⚠️ Отмена спот-ордеров: {resp.get('retMsg', '?')}")
-        except Exception as e:
-            messages.append(f"❌ Ошибка отмены спот-ордеров: {e}")
+        # обычные ордера и условные (SL с triggerPrice) отменяются отдельными запросами
+        for extra, label in (({}, "спот-ордера"), ({"orderFilter": "StopOrder"}, "условные спот-ордера"),
+                             ({"orderFilter": "tpslOrder"}, "TP/SL спот-ордера")):
+            try:
+                resp = self.position_service.client.cancel_all_orders(category="spot", **extra)
+                if resp.get('retCode') == 0:
+                    messages.append(f"✅ Отменены: {label}")
+                else:
+                    messages.append(f"⚠️ Отмена ({label}): {resp.get('retMsg', '?')}")
+            except Exception as e:
+                messages.append(f"❌ Ошибка отмены ({label}): {e}")
 
         try:
             resp = self.position_service.client.cancel_all_orders(category="linear")
@@ -294,20 +355,24 @@ class BotController:
         """
         if self.mode == "PAUSED":
             logger.debug("⏸️ Бот на паузе, пропускаем проверку сигналов")
+            self._note_signal("⏸ пауза", "поиск входов не выполняется")
             return
         
         if self.mode == "RISK_ONLY":
             logger.debug("🟡 Режим RISK_ONLY (только сопровождение позиций), новые сделки запрещены")
+            self._note_signal("🟡 только сопровождение", "новые входы запрещены")
             return
         
         if not self.auto_trading_enabled:
             logger.debug("🔕 Авто-торговля отключена")
+            self._note_signal("🔕 авто-торговля выключена", "включается в Настройках")
             return
 
         # MARKET REGIME FILTER (4H, Variant B): полный запрет новых сделок в плохом режиме
         allowed, regime_reason = market_regime_service.is_trading_allowed()
         if not allowed:
             logger.info(f"🚦 {regime_reason}. Пропускаем поиск сигналов.")
+            self._note_signal("🔴 светофор красный", regime_reason)
             return
 
         if ENTRY_STRATEGY == "FUNNEL":
@@ -355,7 +420,7 @@ class BotController:
                     can_trade, risk_reason = self.trading_service.check_risk_limits()
                     
                     if can_trade:
-                        position, open_error = await self.trading_service.open_position(pair, analysis)
+                        position, open_error = await self.run_exchange(self.trading_service.open_position, pair, analysis)
                         
                         if position:
                             logger.info(f"✅ Позиция открыта: {pair}")
@@ -394,6 +459,10 @@ class BotController:
             except Exception as e:
                 logger.error(f"❌ Ошибка проверки сигнала {pair}: {e}")
     
+    def _note_signal(self, status: str, detail: str = "") -> None:
+        """Итог последней проверки входов — для экрана «🧭 Сигналы»."""
+        self.last_signal_check = {'at': time.time(), 'status': status, 'detail': detail}
+
     async def _check_signals_funnel(self):
         """
         Воронка входа (ENTRY_STRATEGY = "FUNNEL"):
@@ -403,16 +472,22 @@ class BotController:
         """
         open_positions = self.trading_service.trades_repo.get_open_positions()
         open_pairs = [p['pair'] for p in open_positions]
+        try:
+            arb_pairs = [p['pair'] for p in arbitrage_service.repo.get_open_positions()]
+        except Exception:
+            arb_pairs = []
 
         can_trade, risk_reason = self.trading_service.check_risk_limits()
         if not can_trade:
             logger.info(f"🛑 Воронка: новые входы запрещены — {risk_reason}")
+            self._note_signal("🛑 риск-лимит", risk_reason)
             return
 
         candidates = await asyncio.to_thread(
-            entry_funnel_service.scan, exclude=open_pairs, always_include=self.fixed_pairs
+            entry_funnel_service.scan, exclude=open_pairs + arb_pairs, always_include=self.fixed_pairs
         )
         repo = entry_funnel_service.repo
+        self._note_signal("🧭 воронка", f"кандидатов: {len(candidates)}" if candidates else "кандидатов нет")
 
         for c in candidates:
             pair, sid = c['pair'], c.get('signal_id')
@@ -427,7 +502,7 @@ class BotController:
                 repo.update(sid, decision='SKIP', reason=why)
                 continue
 
-            position, err = await self.trading_service.open_position_with_plan(pair, c['plan'])
+            position, err = await self.run_exchange(self.trading_service.open_position_with_plan, pair, c['plan'])
             if not position:
                 repo.update(sid, decision='FAILED', reason=err or 'ошибка открытия')
                 logger.warning(f"⚠️ {pair}: не удалось открыть — {err}")
@@ -436,6 +511,7 @@ class BotController:
                 continue
 
             repo.update(sid, decision='OPENED', position_id=position['position_id'])
+            self._note_signal("✅ открыта позиция", f"{pair}, балл {c['score']}")
             entry = position['entry_price']
             stop_pct = (entry - position['sl_price']) / entry * 100
             tp_pct = (position['tp_price'] - entry) / entry * 100
@@ -605,10 +681,14 @@ class BotController:
         """Сброс дневных лимитов в полночь"""
         logger.info("🔄 Сброс дневных лимитов...")
         
-        # Если бот был на паузе из-за дневных лимитов, возобновляем
-        if self.mode == "PAUSED":
+        # Раньше здесь в полночь снималась ЛЮБАЯ пауза — в том числе после PANIC SELL.
+        # Теперь автоматически снимается только пауза из-за дневного лимита.
+        if self.mode == "PAUSED" and self.pause_reason == "daily_limit":
             self.mode = "ACTIVE"
+            self.pause_reason = ""
             logger.info("▶️ Бот возобновлён после сброса дневных лимитов")
+        elif self.mode == "PAUSED":
+            logger.info(f"⏸ Пауза ({self.pause_reason or 'вручную'}) сохраняется — снимается кнопкой в Telegram")
     
     async def _update_market_pairs(self):
         """Обновление списка пар через сканер (с сохранением на 24ч)"""
@@ -726,7 +806,7 @@ class BotController:
         
         # Если включили, можно сразу запустить обновление (в фоне)
         if self.scanner_enabled:
-            asyncio.create_task(self._update_market_pairs())
+            asyncio.create_task(self.run_job('_update_market_pairs'))
         else:
             self.dynamic_pairs = []
             self.dynamic_pairs_data = {}
@@ -737,7 +817,7 @@ class BotController:
         """Получить текущий режим бота"""
         return self.mode
     
-    def set_mode(self, mode: str):
+    def set_mode(self, mode: str, reason: str = "manual"):
         """Установить режим бота"""
         if mode not in ["ACTIVE", "RISK_ONLY", "PAUSED"]:
             logger.error(f"❌ Неверный режим: {mode}")
@@ -745,6 +825,7 @@ class BotController:
         
         old_mode = self.mode
         self.mode = mode
+        self.pause_reason = reason if mode == "PAUSED" else ""
         
         logger.info(f"🔄 Режим изменён: {old_mode} → {mode}")
     
@@ -876,18 +957,22 @@ class BotController:
                 logger.debug(f"📊 Арбитраж: достигнут лимит позиций ({len(open_positions)}/{max_positions})")
                 return
             
-            # Сканируем возможности
-            opportunities = arbitrage_service.scan_funding_rates()
+            # Сканируем только whitelist (BTC/ETH): остальные пары всё равно не допускаются
+            opportunities = arbitrage_service.scan_funding_rates(
+                pairs=sorted(arbitrage_service.SAFE_COLLATERAL_COINS)
+            )
             
-            # Фильтруем по минимальному funding rate
-            good_opps = [o for o in opportunities if o['funding_rate'] >= ARBITRAGE_MIN_FUNDING_RATE]
+            # Вход только если funding окупает комиссии полного круга достаточно быстро
+            good_opps = [o for o in opportunities if o.get('entry_ok')]
             
             if not good_opps:
-                logger.debug("📊 Арбитраж: нет выгодных возможностей")
+                best = ", ".join(f"{o['pair']} {o['funding_pct']:.4f}% ({o['reason']})" for o in opportunities)
+                logger.info(f"📊 Арбитраж: входа нет — {best or 'нет данных'}")
                 return
             
-            # Проверяем, какие пары уже открыты
+            # Пары с открытым арбитражем или обычной позицией бота пропускаем
             open_pairs = {p['pair'] for p in open_positions}
+            open_pairs |= {p['pair'] for p in self.trading_service.trades_repo.get_open_positions()}
             
             for opp in good_opps:
                 if opp['pair'] in open_pairs:
@@ -913,9 +998,11 @@ class BotController:
             logger.error(f"❌ Ошибка авто-арбитража: {e}")
     
     async def _update_arbitrage_funding(self):
-        """Обновить накопленный funding для всех арбитражных позиций"""
+        """Учесть начисленный funding и закрыть позиции с устойчиво отрицательной ставкой"""
         try:
-            arbitrage_service.update_funding_for_all()
+            messages = await arbitrage_service.settle_funding()
+            for msg in messages:
+                await self._send_notification(msg)
             logger.info("💰 Funding арбитражных позиций обновлён")
         except Exception as e:
             logger.error(f"❌ Ошибка обновления funding: {e}")

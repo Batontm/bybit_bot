@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Iterable, List, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -94,13 +95,21 @@ def _build_arbitrage_jobs() -> List[JobSpec]:
 def _register(scheduler: AsyncIOScheduler, controller: 'BotController',
               jobs: Iterable[JobSpec]) -> None:
     for job_id, name, method_name, trigger in jobs:
-        callback = getattr(controller, method_name)
+        getattr(controller, method_name)  # опечатка в имени метода — ошибка сразу при старте
+        # Задача выполняется в фоновом потоке через controller.run_job,
+        # чтобы запросы к бирже не блокировали Telegram и планировщик.
+        if hasattr(controller, 'run_job'):
+            callback = partial(controller.run_job, method_name)
+        else:
+            callback = getattr(controller, method_name)
         scheduler.add_job(
             callback,
             trigger=trigger,
             id=job_id,
             name=name,
             max_instances=1,
+            coalesce=True,           # пропущенные запуски схлопываются в один
+            misfire_grace_time=60,   # опоздание до минуты — запускаем, а не пропускаем
         )
 
 
