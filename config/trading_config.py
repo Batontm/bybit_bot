@@ -176,6 +176,16 @@ TREND_TRAIL_ATR = 3.0
 TREND_RISK_PER_TRADE = 0.005      # 0.5% капитала на сделку (с комиссиями)
 TREND_MAX_POSITIONS = 3
 
+# --- Фильтры пробоя по открытым данным других бирж (bot/services/ext_market_data.py) ---
+# Ключи API не нужны. Включать только после бэктеста:
+#   python -m bot.backtest --strategy trend --days 1095 --ext
+TREND_EXT_FUNDING = False          # не входить, если лонги перегреты (funding Bybit+Binance)
+TREND_EXT_FUNDING_MAX_DAY = 0.0006 # сумма ставок за сутки > 0.06% (норма ~0.03%: 0.01% × 3)
+TREND_EXT_VOLUME = False           # пробой только на объёме выше среднего (Bybit + Binance)
+TREND_EXT_VOLUME_MIN = 1.0         # объём дня / средний за 20 дней
+TREND_EXT_PREMIUM = False          # премия Coinbase к Bybit (спрос из США) не отрицательная
+TREND_EXT_PREMIUM_MIN = 0.0        # средняя за 3 дня
+
 # ============= ПЕРЕХОД НА РЕАЛЬНЫЕ ДЕНЬГИ =============
 # На основном (не демо) счёте бот не открывает сделки, пока в .env не задано
 # LIVE_TRADING_CONFIRMED=yes — защита от случайного запуска с боевыми ключами.

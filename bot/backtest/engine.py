@@ -383,9 +383,15 @@ TREND_GRID = [
 
 
 def run_trend(data: Dict[str, Dict[str, List[dict]]], pairs: Iterable[str], *,
-              start_ts: int, end_ts: int, equity: float = 10_000.0, use_guard: bool = True, **_ignored) -> Result:
-    """Трендовая стратегия на дневных свечах (склеенных из 4h). Вход по закрытию дня, стоп внутри дня."""
+              start_ts: int, end_ts: int, equity: float = 10_000.0, use_guard: bool = True,
+              ext: Optional[Dict[str, Dict[int, dict]]] = None, **_ignored) -> Result:
+    """
+    Трендовая стратегия на дневных свечах (склеенных из 4h). Вход по закрытию дня, стоп внутри дня.
+    ext — признаки других бирж {pair: {день: {...}}}; фильтры включаются флагами TREND_EXT_*.
+    """
     from bot.services import trend_strategy as T
+    from bot.services.ext_market_data import ext_filter, any_filter_enabled
+    use_ext = bool(ext) and any_filter_enabled()
     slip = cfg.SLIPPAGE_ESTIMATE
     D1 = T.D1
     pairs = [p for p in pairs if p in data]
@@ -428,6 +434,13 @@ def run_trend(data: Dict[str, Dict[str, List[dict]]], pairs: Iterable[str], *,
             if not ok:
                 continue
             res.signals_seen += 1
+            if use_ext:
+                ok_ext, why = ext_filter((ext.get(pair) or {}).get(today['start']))
+                if not ok_ext:
+                    key = ('funding высокий' if why.startswith('funding') else
+                           'объём пробоя слабый' if why.startswith('объём') else 'премия Coinbase низкая')
+                    res.skipped[key] = res.skipped.get(key, 0) + 1
+                    continue
             entry, stop = today['close'] * (1 + slip), info['stop']
             qty = X.position_size(equity, cfg.TREND_RISK_PER_TRADE, entry, stop)
             qty = min(qty, equity * 0.98 / entry)

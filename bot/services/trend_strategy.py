@@ -99,6 +99,21 @@ class TrendService:
             return []
         return closed_candles(resp['result']['list'])
 
+    def _ext_check(self, pair: str, days: List[dict]) -> Tuple[bool, str]:
+        """Фильтры по данным других бирж (если включены в config). Ошибки источников не блокируют вход."""
+        from . import ext_market_data as X
+        if not X.any_filter_enabled():
+            return True, ""
+        try:
+            end_ms = days[-1]['start'] + D1
+            start_ms = end_ms - 45 * D1
+            recent = [d for d in days if d['start'] >= start_ms]
+            feats, _ = X.features_for(pair, recent, start_ms, end_ms, bybit_client=self.client,
+                                      use_cache=False, log=lambda *a: None)
+            return X.ext_filter(feats.get(days[-1]['start']))
+        except Exception as e:
+            return True, f"данные других бирж недоступны ({e})"
+
     async def run(self, trading_service, position_service, allow_entries: bool = True) -> List[str]:
         if not cfg.TREND_ENABLED:
             return []
@@ -142,6 +157,10 @@ class TrendService:
             # --- новый вход
             ok, info = entry_signal(days)
             if not ok:
+                continue
+            ok_ext, why = self._ext_check(pair, days)
+            if not ok_ext:
+                messages.append(f"⏭ Тренд {pair}: пробой есть, но вход пропущен — {why}")
                 continue
             res, err = await trading_service.open_trend_position(pair, info['stop'], info['atr'])
             if res:

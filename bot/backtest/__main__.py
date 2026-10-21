@@ -8,6 +8,7 @@ CLI бэктестера.
   python -m bot.backtest --require-pullback       # брать только входы с откатом 1h
   python -m bot.backtest --offline                # только кэш, без загрузки
   python -m bot.backtest --strategy trend         # только трендовая стратегия (D1)
+  python -m bot.backtest --strategy trend --days 1095 --ext   # + фильтры по данным других бирж
 
 Результаты: data/backtest/<дата>/ — report.md, trades.csv, summary.json
 """
@@ -109,6 +110,57 @@ def verdict(m: dict, wf: dict | None, min_trades: int = 50) -> list:
     return lines
 
 
+EXT_VARIANTS = [
+    ("без фильтров", {}),
+    ("+ funding (лонги не перегреты)", {'TREND_EXT_FUNDING': True}),
+    ("+ объём пробоя (Bybit+Binance)", {'TREND_EXT_VOLUME': True}),
+    ("+ премия Coinbase", {'TREND_EXT_PREMIUM': True}),
+    ("все три", {'TREND_EXT_FUNDING': True, 'TREND_EXT_VOLUME': True, 'TREND_EXT_PREMIUM': True}),
+]
+
+
+def ext_comparison(data, trend_pairs, start_ts, end_ts, args, loader=None):
+    """Тренд с фильтрами по данным других бирж: каждый фильтр отдельно и все вместе."""
+    from bot.services import trend_strategy as T
+    from bot.services import ext_market_data as X
+    loader = loader or X.features_for
+    print("🌐 Данные других бирж (Binance, Coinbase, funding)...")
+    feats, statuses = {}, {}
+    for p in trend_pairs:
+        days = T.daily_from_4h(data[p]['240'])
+        if not days:
+            continue
+        feats[p], statuses[p] = loader(p, days, days[0]['start'], end_ts)
+    lines = ["### Фильтры по данным других бирж", "",
+             "Тот же тренд, но пробой пропускается, если фильтр против. Ключи API не нужны — открытые данные.", "",
+             "Источники: " + "; ".join(f"{p}: " + ", ".join(f"{k} {v}" for k, v in st.items())
+                                       for p, st in statuses.items()), "",
+             "| Вариант | Сделок | Средний R | PF | Доходность | Просадка | Проверка: сделок / R / PF | Отсеяно |",
+             "|---|---|---|---|---|---|---|---|"]
+    off = {'TREND_EXT_FUNDING': False, 'TREND_EXT_VOLUME': False, 'TREND_EXT_PREMIUM': False}
+    out = {}
+    for name, flags in EXT_VARIANTS:
+        with E.override({**off, **flags}):
+            r = E.run_trend(data, trend_pairs, start_ts=start_ts, end_ts=end_ts, equity=args.equity,
+                            use_guard=not args.no_guard, ext=feats)
+            m = E.metrics(r)
+            wf = None
+            if not args.no_walk_forward and args.folds >= 2:
+                wf = E.walk_forward(data, trend_pairs, start_ts=start_ts, end_ts=end_ts, folds=args.folds,
+                                    equity=args.equity, grid=E.TREND_GRID, runner=E.run_trend,
+                                    min_train_trades=3, use_guard=not args.no_guard, ext=feats, log=lambda *a: None)
+        pf = "∞" if m['profit_factor'] == float('inf') else f"{m['profit_factor']:.2f}"
+        wf_txt = (f"{wf['oos_trades']} / {wf['oos_avg_r']:+.2f} / {wf['oos_profit_factor']:.2f}" if wf else "—")
+        skipped = ", ".join(f"{k} {v}" for k, v in m['skipped'].items()) or "—"
+        lines.append(f"| {name} | {m['trades']} | {m['avg_r']:+.2f} | {pf} | {_pct(m['total_return'])} | "
+                     f"{m['max_drawdown'] * 100:.1f}% | {wf_txt} | {skipped} |")
+        out[name] = {'metrics': m, 'walk_forward': {k: v for k, v in (wf or {}).items() if k != 'steps'}}
+    lines += ["", "> Фильтр стоит включать, только если на проверке (walk-forward) средний R и PF выше, чем "
+                  "«без фильтров», а сделок осталось хотя бы 15. Иначе это подгонка под историю. "
+                  "Включение — в config/trading_config.py: TREND_EXT_FUNDING / TREND_EXT_VOLUME / TREND_EXT_PREMIUM.", ""]
+    return lines, out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m bot.backtest", description="Бэктест воронки входа")
     ap.add_argument("--days", type=int, default=365, help="длина периода в днях (по умолчанию 365)")
@@ -122,6 +174,8 @@ def main(argv=None) -> int:
     ap.add_argument("--offline", action="store_true", help="не качать, использовать только кэш")
     ap.add_argument("--strategy", choices=("funnel", "trend", "both"), default="both",
                     help="какую стратегию проверять (по умолчанию обе)")
+    ap.add_argument("--ext", action="store_true",
+                    help="тренд: сравнить фильтры по открытым данным Binance/Coinbase (funding, объём, премия)")
     ap.add_argument("--out", default=None, help="папка для отчёта (по умолчанию data/backtest/<дата>)")
     args = ap.parse_args(argv)
 
@@ -206,6 +260,10 @@ def main(argv=None) -> int:
         lines += _fmt_wf(twf, fmt_d)
         lines += verdict(tm, twf, min_trades=15)
         summary['trend'] = {'metrics': tm, 'walk_forward': {k: v for k, v in (twf or {}).items() if k != 'steps'}}
+        if args.ext:
+            ext_lines, ext_summary = ext_comparison(data, trend_pairs, start_ts, end_ts, args)
+            lines += ext_lines
+            summary['trend_ext'] = ext_summary
         if res is None:
             res, m = tres, tm
 

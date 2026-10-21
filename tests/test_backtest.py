@@ -275,3 +275,105 @@ def test_load_dataset_skips_failing_pair(tmp_path, monkeypatch):
     monkeypatch.setattr(bd, 'fetch_klines', fake)
     d = bd.load_dataset(['BADUSDT', 'ETHUSDT'], 5, cache_dir=tmp_path, log=lambda m: None)
     assert set(d) == {'BTCUSDT', 'ETHUSDT'}
+
+
+# ----------------------------------------------------------------- данные других бирж
+
+def test_ext_loaders_parse_and_paginate(monkeypatch):
+    from bot.services import ext_market_data as X
+    monkeypatch.setattr(X.time, 'sleep', lambda s: None)
+    D = X.D1
+    calls = []
+
+    def fake_get(url, params=None):
+        calls.append((url, params))
+        if 'klines' in url:
+            s = params['startTime']
+            return [[s + i * D, '1', '2', '0.5', str(10 + i), str(100 + i)] for i in range(3)]
+        if 'fundingRate' in url:
+            return [{'fundingTime': params['startTime'] + i * 8 * 3_600_000, 'fundingRate': '0.0001'} for i in range(3)]
+        if 'coinbase' in url:
+            return [[(0 + i * D) // 1000, 0.5, 2, 1, 11 + i, 5] for i in range(3)]
+        raise AssertionError(url)
+
+    days = X.binance_daily('BTCUSDT', 0, 10 * D, get=fake_get)
+    assert sorted(days) == [0, D, 2 * D] and days[D] == {'close': 11.0, 'volume': 101.0}
+    fund = X.binance_funding('BTCUSDT', 0, 10 * D, get=fake_get)
+    fd = X.funding_by_day(fund)
+    assert list(fd) == [0] and abs(fd[0] - 0.0003) < 1e-12
+    cb = X.coinbase_daily('BTC-USD', 0, 3 * D, get=fake_get)
+    assert cb[2 * D]['close'] == 13.0
+
+
+def test_build_features_and_filter(monkeypatch):
+    from bot.services import ext_market_data as X
+    D = X.D1
+    bybit = [{'start': i * D, 'close': 100.0, 'volume': 10.0} for i in range(25)]
+    binance = {i * D: {'close': 100.0, 'volume': 30.0} for i in range(25)}
+    binance[24 * D]['volume'] = 70.0                       # день пробоя: объём 80 vs средний 40
+    fund = [{i * D: 0.0003 for i in range(25)}, {i * D: 0.0009 for i in range(25)}]
+    cb = {i * D: {'close': 100.1, 'volume': 1} for i in range(25)}
+    f = X.build_features(bybit, binance_days=binance, funding_sources=fund, coinbase_days=cb)[24 * D]
+    assert abs(f['volume_ratio'] - 2.0) < 1e-9
+    assert abs(f['funding_day'] - 0.0006) < 1e-12
+    assert abs(f['cb_premium'] - 0.001) < 1e-9
+
+    for k in ('TREND_EXT_FUNDING', 'TREND_EXT_VOLUME', 'TREND_EXT_PREMIUM'):
+        monkeypatch.setattr(X.cfg, k, False)
+    assert X.ext_filter(f) == (True, 'ок') and not X.any_filter_enabled()
+    monkeypatch.setattr(X.cfg, 'TREND_EXT_FUNDING', True)
+    monkeypatch.setattr(X.cfg, 'TREND_EXT_FUNDING_MAX_DAY', 0.0005)
+    ok, why = X.ext_filter(f)
+    assert not ok and 'funding' in why
+    assert X.ext_filter(None)[0]                           # нет данных — не мешаем
+    assert X.ext_filter({'funding_day': None, 'volume_ratio': None, 'cb_premium': None})[0]
+
+
+def test_run_trend_ext_filter_blocks_entries(dataset):
+    from bot.services import trend_strategy as T
+    start, end = _period(dataset, 60)
+    params = {'TREND_FILTER_EMA': 20, 'TREND_BREAKOUT_DAYS': 5}
+    with E.override(params):
+        base = E.run_trend(dataset, ['BTCUSDT', 'ALTUSDT'], start_ts=start, end_ts=end)
+    feats = {p: {d['start']: {'funding_day': 0.01, 'volume_ratio': None, 'cb_premium': None}
+                 for d in T.daily_from_4h(dataset[p]['240'])} for p in ('BTCUSDT', 'ALTUSDT')}
+    with E.override({**params, 'TREND_EXT_FUNDING': True}):
+        blocked = E.run_trend(dataset, ['BTCUSDT', 'ALTUSDT'], start_ts=start, end_ts=end, ext=feats)
+    with E.override(params):   # фильтры выключены — ext не влияет
+        same = E.run_trend(dataset, ['BTCUSDT', 'ALTUSDT'], start_ts=start, end_ts=end, ext=feats)
+    assert len(blocked.trades) == 0
+    assert len(same.trades) == len(base.trades)
+    if base.trades:
+        assert blocked.skipped.get('funding высокий', 0) > 0
+
+
+def test_cli_trend_ext_comparison(dataset, tmp_path, monkeypatch):
+    from bot.backtest import __main__ as cli
+    from bot.services import ext_market_data as X
+    monkeypatch.setattr(cli, 'load_dataset', lambda pairs, days, offline=False, **kw: dataset)
+    monkeypatch.setattr(cli.cfg, 'TREND_PAIRS', ['BTCUSDT', 'ALTUSDT'])
+    monkeypatch.setattr(X, 'features_for', lambda p, days, s, e, **kw: (
+        {d['start']: {'funding_day': 0.0, 'volume_ratio': 1.5, 'cb_premium': 0.001} for d in days},
+        {'binance_spot': 'ок (1)'}))
+    out = tmp_path / "ext"
+    assert cli.main(["--days", "60", "--strategy", "trend", "--folds", "2", "--ext", "--out", str(out)]) == 0
+    report = (out / "report.md").read_text(encoding="utf-8")
+    assert "Фильтры по данным других бирж" in report
+    for name, _ in cli.EXT_VARIANTS:
+        assert f"| {name} |" in report
+
+
+def test_trend_live_ext_check_off_and_failsafe(monkeypatch):
+    from bot.services import trend_strategy as T
+    from bot.services import ext_market_data as X
+    svc = T.TrendService(client=object())
+    for k in ('TREND_EXT_FUNDING', 'TREND_EXT_VOLUME', 'TREND_EXT_PREMIUM'):
+        monkeypatch.setattr(X.cfg, k, False)
+    assert svc._ext_check('BTCUSDT', [{'start': 0}]) == (True, "")
+    monkeypatch.setattr(X.cfg, 'TREND_EXT_VOLUME', True)
+
+    def boom(*a, **k):
+        raise RuntimeError("451 blocked")
+    monkeypatch.setattr(X, 'features_for', boom)
+    ok, why = svc._ext_check('BTCUSDT', [{'start': 0}])
+    assert ok and 'недоступны' in why
