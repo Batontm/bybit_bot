@@ -38,7 +38,7 @@ from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 
 
-BOT_VERSION = "v2.5.0"
+BOT_VERSION = "v2.6.0"
 
 
 class BotController:
@@ -178,6 +178,13 @@ class BotController:
 
         # Получаем настройки сканера из БД
         self._load_settings()
+
+        # Реальный счёт: без явного подтверждения в .env бот не открывает сделки
+        live, confirmed = self.live_trading_status()
+        if live and not confirmed:
+            self.mode = "RISK_ONLY"
+            logger.warning("⚠️ Подключён РЕАЛЬНЫЙ счёт Bybit, а LIVE_TRADING_CONFIRMED=yes в .env нет — "
+                           "новые сделки выключены (режим RISK_ONLY)")
         
         # Запуск WebSocket
         active_pairs = self.get_active_pairs()
@@ -190,6 +197,8 @@ class BotController:
         self.scheduler.start()
         self.is_running = True
         
+        asyncio.create_task(self.run_job('_rebuild_protection_once'))
+
         # Сразу запускаем сканер если он включен
         if self.scanner_enabled:
             asyncio.create_task(self.run_job('_update_market_pairs'))
@@ -459,6 +468,15 @@ class BotController:
             except Exception as e:
                 logger.error(f"❌ Ошибка проверки сигнала {pair}: {e}")
     
+    @staticmethod
+    def live_trading_status():
+        """(реальный ли счёт, подтверждена ли торговля на нём в .env)."""
+        import os
+        from config.api_config import BYBIT_DEMO, BYBIT_TESTNET
+        live = not (BYBIT_DEMO or BYBIT_TESTNET)
+        confirmed = os.getenv("LIVE_TRADING_CONFIRMED", "").strip().lower() == "yes"
+        return live, confirmed
+
     def _note_signal(self, status: str, detail: str = "") -> None:
         """Итог последней проверки входов — для экрана «🧭 Сигналы»."""
         self.last_signal_check = {'at': time.time(), 'status': status, 'detail': detail}
@@ -563,13 +581,40 @@ class BotController:
             logger.error(f"❌ Ошибка обновления балансов: {e}")
     
     async def _check_tpsl(self):
-        """Проверка исполнения TP/SL"""
-        # В реальности TP/SL будут исполняться биржей автоматически
-        # Эта функция для дополнительной проверки и синхронизации
+        """Цены позиций + тейки (их ведёт бот: на бирже стоит только стоп)"""
         try:
             await self.position_service.update_positions_prices()
+            for msg in await self.position_service.check_take_profits():
+                await self._send_notification(msg)
         except Exception as e:
             logger.error(f"❌ Ошибка проверки TP/SL: {e}")
+
+    async def _run_trend(self):
+        """Трендовая стратегия на дневных свечах: стопы подтягиваются всегда, входы — только в ACTIVE."""
+        try:
+            from .services.trend_strategy import trend_service
+            allow = self.mode == "ACTIVE" and self.auto_trading_enabled
+            messages = await trend_service.run(self.trading_service, self.position_service, allow_entries=allow)
+            for msg in messages:
+                await self._send_notification(msg)
+        except Exception as e:
+            logger.error(f"❌ Трендовая стратегия: {e}")
+
+    async def _rebuild_protection_once(self):
+        """v2.6: снять лимитные тейки старых версий и переставить стопы как StopOrder (один раз)."""
+        try:
+            with db.transaction() as conn:
+                row = conn.execute("SELECT value FROM settings WHERE key = 'protection_v26'").fetchone()
+                if row and row[0] == '1':
+                    return
+            messages = await self.position_service.rebuild_protection()
+            with db.transaction() as conn:
+                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('protection_v26', '1')")
+            if messages:
+                await self._send_notification("🔧 Защита позиций перестроена (стоп на бирже, тейки ведёт бот):\n"
+                                              + "\n".join(messages))
+        except Exception as e:
+            logger.error(f"❌ Перестройка защиты позиций: {e}")
     
     async def _update_positions_prices(self):
         """Обновление цен открытых позиций"""
@@ -827,6 +872,10 @@ class BotController:
             logger.error(f"❌ Неверный режим: {mode}")
             return
         
+        live, confirmed = self.live_trading_status()
+        if mode == "ACTIVE" and live and not confirmed:
+            logger.warning("⚠️ Реальный счёт без LIVE_TRADING_CONFIRMED=yes — остаюсь в RISK_ONLY")
+            mode = "RISK_ONLY"
         old_mode = self.mode
         self.mode = mode
         self.pause_reason = reason if mode == "PAUSED" else ""

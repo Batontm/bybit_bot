@@ -66,6 +66,7 @@ class AiogramTelegramBot:
             await self.bot.set_my_commands([
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="health", description="Дашборд: баланс, позиции, риск"),
+                BotCommand(command="results", description="Результаты и готовность к реальным деньгам"),
                 BotCommand(command="positions", description="Позиции и их закрытие"),
                 BotCommand(command="signals", description="Сигналы: последний проход воронки"),
                 BotCommand(command="regime", description="Светофор BTC 4H"),
@@ -134,10 +135,18 @@ class AiogramTelegramBot:
     async def send_startup_message(self, startup_checks: dict) -> None:
         from bot.controller import BOT_VERSION
         from config.trading_config import ENTRY_STRATEGY
+        from bot.controller import controller as _ctrl
+        from config.trading_config import TREND_ENABLED, TRADING_CAPITAL_LIMIT_USDT
+        live, confirmed = _ctrl.live_trading_status()
+        account = ("💰 <b>РЕАЛЬНЫЙ СЧЁТ</b>" + ("" if confirmed else " — сделки выключены, нет LIVE_TRADING_CONFIRMED=yes")
+                   if live else "🧪 Демо-счёт")
         lines = [
             f"🤖 <b>Бот запущен</b> ({BOT_VERSION})",
-            f"Режим: {startup_checks.get('mode', 'UNKNOWN')} | Стратегия: {ENTRY_STRATEGY}",
+            account,
+            f"Режим: {_ctrl.get_mode()} | Стратегии: {ENTRY_STRATEGY}{' + TREND' if TREND_ENABLED else ''}",
         ]
+        if TRADING_CAPITAL_LIMIT_USDT:
+            lines.append(f"Лимит капитала для бота: ${TRADING_CAPITAL_LIMIT_USDT:,.0f}")
         # Те же кнопки, что и в главном меню: у каждой есть обработчик
         from .handlers import _main_menu_kb
         await self.send_message("\n".join(lines), reply_markup=_main_menu_kb().as_markup())

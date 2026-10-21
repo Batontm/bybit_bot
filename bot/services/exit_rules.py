@@ -136,13 +136,13 @@ def simulate_bar(pos: SimPosition, bar: dict) -> bool:
     # 2. TP1 — частичная фиксация (лимит)
     if pos.lv.partial is not None and not pos.partial_done and bar['high'] >= pos.lv.partial:
         part = pos.qty * cfg.EXIT_PARTIAL_FRACTION
-        sell('tp1', pos.lv.partial, part)
+        sell('tp1', pos.lv.partial * (1 - slip), part)   # тейки ведёт бот рыночным ордером
         pos.partial_done = True
         pos.stop = max(pos.stop, breakeven_stop(pos.entry))
 
     # 3. TP2 / тейк (лимит)
     if bar['high'] >= pos.lv.target:
-        sell('tp', pos.lv.target, pos.remaining)
+        sell('tp', pos.lv.target * (1 - slip), pos.remaining)
         return True
 
     # 4. Безубыток

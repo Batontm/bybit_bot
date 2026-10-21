@@ -160,12 +160,13 @@ def test_walk_forward_runs(dataset):
 
 def test_cli_offline_report(dataset, tmp_path, monkeypatch):
     from bot.backtest import __main__ as cli
-    monkeypatch.setattr(cli, 'load_dataset', lambda pairs, days, offline=False: dataset)
+    monkeypatch.setattr(cli, 'load_dataset', lambda pairs, days, offline=False, **kw: dataset)
     out = tmp_path / "bt"
-    code = cli.main(["--days", "60", "--pairs", "ALTUSDT,ALT2USDT", "--folds", "2", "--out", str(out)])
+    code = cli.main(["--days", "60", "--pairs", "ALTUSDT,ALT2USDT", "--folds", "2", "--out", str(out),
+                     "--strategy", "funnel"])
     assert code == 0
     report = (out / "report.md").read_text(encoding="utf-8")
-    assert "Walk-forward" in report and "## Вывод" in report
+    assert "Walk-forward" in report and "### Вывод" in report
     assert (out / "trades.csv").exists() and (out / "summary.json").exists()
 
 
@@ -196,3 +197,48 @@ def test_fetch_klines_paginates_and_caches(tmp_path):
     again = D.fetch_klines('XUSDT', '60', first, first + 2500 * step, client=client, cache_dir=tmp_path,
                            log=lambda *a: None)
     assert len(again) == 2500 and client.calls == calls
+
+
+# ----------------------------------------------------------------- тренд
+
+def test_trend_rules_on_synthetic_uptrend():
+    from bot.services import trend_strategy as T
+    days = []
+    price = 100.0
+    for i in range(200):
+        o = price
+        price *= 1.004 if i < 180 else 1.03          # в конце — рывок вверх (пробой)
+        days.append({'start': i * T.D1, 'open': o, 'high': price * 1.01, 'low': o * 0.99, 'close': price,
+                     'volume': 1})
+    ok, info = T.entry_signal(days)
+    assert ok and info['stop'] < info['close'] and info['close'] > info['breakout_level']
+    assert T.chandelier_stop(info['stop'], info['close'] * 1.2, info['atr']) > info['stop']
+    assert T.chandelier_stop(info['stop'], info['close'] * 0.5, info['atr']) == info['stop']   # только вверх
+
+
+def test_daily_from_4h_skips_partial_days():
+    from bot.services import trend_strategy as T
+    c = [{'start': i * 4 * 3_600_000, 'open': 1, 'high': 2 + i, 'low': 0.5, 'close': 1.5, 'volume': 1}
+         for i in range(14)]          # 2 полных дня + 2 свечи третьего
+    d = T.daily_from_4h(c)
+    assert len(d) == 2 and d[0]['high'] == 7 and d[1]['high'] == 13
+
+
+def test_run_trend_backtest(dataset):
+    start, end = _period(dataset, 60)
+    with E.override({'TREND_FILTER_EMA': 20, 'TREND_BREAKOUT_DAYS': 5}):
+        res = E.run_trend(dataset, ['BTCUSDT', 'ALTUSDT'], start_ts=start, end_ts=end)
+    m = E.metrics(res)
+    assert m['trades'] == len(res.trades)
+    for t in res.trades:
+        assert t.trigger == 'breakout' and t.risk_usd > 0 and t.r_multiple > -1.5
+
+
+def test_cli_trend_only(dataset, tmp_path, monkeypatch):
+    from bot.backtest import __main__ as cli
+    monkeypatch.setattr(cli, 'load_dataset', lambda pairs, days, offline=False, **kw: dataset)
+    monkeypatch.setattr(cli.cfg, 'TREND_PAIRS', ['BTCUSDT', 'ALTUSDT'])
+    out = tmp_path / "tr"
+    assert cli.main(["--days", "60", "--strategy", "trend", "--folds", "2", "--out", str(out)]) == 0
+    report = (out / "report.md").read_text(encoding="utf-8")
+    assert "## Тренд" in report and "### Вывод" in report

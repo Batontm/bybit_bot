@@ -98,9 +98,16 @@ class BalanceService:
             return []
     
     def get_deposit_usdt(self) -> float:
-        """Получить общий депозит в USDT"""
+        """
+        Капитал для расчёта риска: USDT на счёте, но не больше TRADING_CAPITAL_LIMIT_USDT
+        (если задан) — так на реальном счёте можно отдать боту только часть денег.
+        """
+        from config.trading_config import TRADING_CAPITAL_LIMIT_USDT
         balance = self.get_usdt_balance()
-        return balance['total'] if balance else 0.0
+        total = balance['total'] if balance else 0.0
+        if TRADING_CAPITAL_LIMIT_USDT and TRADING_CAPITAL_LIMIT_USDT > 0:
+            return min(total, float(TRADING_CAPITAL_LIMIT_USDT))
+        return total
     
     def calculate_position_size(self, risk_percent: float, 
                                entry_price: float, 

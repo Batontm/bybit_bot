@@ -78,6 +78,10 @@ def _build_jobs() -> List[JobSpec]:
         # Динамические пары
         ('update_pairs',      'Обновление списка пар',
          '_update_market_pairs', IntervalTrigger(hours=1)),
+
+        # Трендовая стратегия: после закрытия дневной свечи (00:00 UTC) и ещё 3 раза в сутки
+        ('trend_strategy',    'Трендовая стратегия (D1)',
+         '_run_trend', CronTrigger(hour='0,6,12,18', minute=10, timezone='UTC')),
     ]
 
 

@@ -105,6 +105,7 @@ def _is_allowed_callback(callback: CallbackQuery) -> bool:
 def _main_menu_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Дашборд", callback_data="tg:health")
+    kb.button(text="🏁 Результаты", callback_data="tg:results")
     kb.button(text="📂 Позиции", callback_data="tg:positions")
     kb.button(text="🧭 Сигналы", callback_data="tg:signals")
     kb.button(text="🚦 Режим", callback_data="tg:regime")
@@ -113,7 +114,7 @@ def _main_menu_kb() -> InlineKeyboardBuilder:
     kb.button(text="⚙️ Настройки", callback_data="tg:settings")
     kb.button(text="🛠 Сервис", callback_data="tg:service")
     kb.button(text="🛑 PANIC SELL", callback_data="tg:panic_confirm")
-    kb.adjust(1, 2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 2)
     return kb
 
 
@@ -306,14 +307,19 @@ def _format_open_positions_block(max_rows: int = 10) -> str:
             pnl_txt = f"<code>{pnl_pct:+.2f}%</code> ({_usd(pnl_usd, sign=True)})"
         else:
             pnl_emoji, pnl_txt = "⬜️", "<code>n/a</code>"
-        lines.append(f"{pnl_emoji} <b>{html.escape(coin)}</b>: {pnl_txt}")
+        tag = " 🐢" if p.get('strategy') == 'TREND' else ""
+        lines.append(f"{pnl_emoji} <b>{html.escape(coin)}</b>{tag}: {pnl_txt}")
         lines.append(f"   {_price(entry)} → {_price(cur)}")
-        sl, tp = p.get('sl_price'), p.get('tp_price')
+        sl, tp, tp1 = p.get('sl_price'), p.get('tp_price'), p.get('tp1_price')
         parts = []
         if sl:
             parts.append(f"SL {_price(float(sl))}")
+        if tp1 and not p.get('partial_taken'):
+            parts.append(f"TP1 {_price(float(tp1))}")
         if tp:
             parts.append(f"TP {_price(float(tp))}")
+        elif p.get('strategy') == 'TREND':
+            parts.append("тейка нет — трейлинг")
         if parts:
             lines.append("   " + " | ".join(parts))
 
@@ -745,6 +751,36 @@ def _format_pnl_summary(days: int = 7) -> str:
         return f"📈 <b>PnL</b>\n\n❌ Ошибка: {html.escape(str(e))}"
 
 
+_ERROR_TYPES = {
+    'OrderError': 'вход', 'SLError': 'стоп', 'AutoSLError': 'авто-стоп', 'TPSLError': 'тейк/стоп',
+    'TPSellError': 'продажа по тейку', 'CloseError': 'закрытие', 'BalanceError': 'баланс',
+    'PriceError': 'цена', 'DCAError': 'докупка', 'OpenError': 'арбитраж: вход',
+}
+
+
+def _format_error_lines(items: list) -> list:
+    """Время ЧЧ:ММ:СС, что делал бот, суть ошибки и параметры запроса (пара, количество)."""
+    import re
+    out = []
+    for e in items[-15:]:
+        ts = str(e.get('timestamp', ''))
+        hhmm = ts[11:19] if len(ts) >= 19 else ts
+        kind = _ERROR_TYPES.get(e.get('error_type', ''), e.get('error_type', ''))
+        msg = str(e.get('message', ''))
+        # pybit: «текст (ErrCode: N) (ErrTime: ...). Request → POST url: {params}» — оставляем суть и параметры
+        head = re.split(r'\(ErrTime', msg)[0].strip()
+        params = re.search(r'\{.*\}', msg)
+        detail = ""
+        if params:
+            keep = re.findall(r"""['"](symbol|side|qty|price|triggerPrice|orderType|orderFilter)['"]\s*:\s*['"]?([^'",}]*)""",
+                              params.group(0))
+            if keep:
+                detail = " — " + ", ".join(f"{k}={v}" for k, v in keep)
+        out.append(f"<code>{hhmm}</code> {html.escape(e.get('module', ''))}/{html.escape(kind)}: "
+                   f"{html.escape((head + detail)[:300])}")
+    return out
+
+
 def _format_today_pnl() -> str:
     """Закрытые сегодня (UTC) позиции — без ожидания суточного пересчёта."""
     try:
@@ -759,6 +795,109 @@ def _format_today_pnl() -> str:
         return f"📅 Сегодня (UTC): <b>{_usd(net, sign=True)}</b> | сделок {len(rows)}, в плюс {wins}"
     except Exception:
         return ""
+
+
+# ----------------------------------------------------------------- 🏁 Результаты
+
+def _closed_positions(days: int = 0) -> list:
+    from bot.db.connection import get_db
+    with get_db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT pair, strategy, net_pnl, realized_pnl, risk_usd, closed_at, opened_at FROM positions "
+            "WHERE status = 'CLOSED' AND closed_at IS NOT NULL ORDER BY closed_at ASC").fetchall()]
+    if days > 0:
+        from datetime import datetime, timedelta
+        from config.settings import TIMEZONE
+        cutoff = (datetime.now(TIMEZONE) - timedelta(days=days)).isoformat()
+        rows = [r for r in rows if str(r['closed_at']) >= cutoff]
+    return rows
+
+
+def _stats(rows: list, equity: float) -> dict:
+    pnls = [float(r['net_pnl'] if r['net_pnl'] not in (None, 0) else (r['realized_pnl'] or 0)) for r in rows]
+    rs = [p / float(r['risk_usd']) for p, r in zip(pnls, rows) if r.get('risk_usd')]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    gw, gl = sum(wins), -sum(losses)
+    # просадка по закрытым сделкам относительно капитала на начало периода
+    start = max(1.0, equity - sum(pnls))
+    peak, cur, max_dd = start, start, 0.0
+    for p in pnls:
+        cur += p
+        peak = max(peak, cur)
+        max_dd = max(max_dd, 1 - cur / peak)
+    streak = 0
+    for p in reversed(pnls):
+        if p >= 0:
+            break
+        streak += 1
+    return {
+        'n': len(pnls), 'pnl': sum(pnls), 'win_rate': len(wins) / len(pnls) if pnls else 0.0,
+        'avg_r': sum(rs) / len(rs) if rs else None, 'r_n': len(rs),
+        'pf': gw / gl if gl > 0 else (float('inf') if gw > 0 else 0.0),
+        'max_dd': max_dd, 'streak': streak,
+        'best': max(pnls) if pnls else 0.0, 'worst': min(pnls) if pnls else 0.0,
+    }
+
+
+def _readiness(st: dict):
+    """Критерии перехода на реальные деньги (те же, что в отчёте бэктеста)."""
+    from config.trading_config import MAX_DRAWDOWN_STOP
+    avg_r_txt = "n/a" if st['avg_r'] is None else f"{st['avg_r']:+.2f}R"
+    pf_txt = "∞" if st['pf'] == float('inf') else f"{st['pf']:.2f}"
+    checks = [
+        (st['n'] >= 50, f"сделок ≥ 50 (сейчас {st['n']})"),
+        ((st['avg_r'] or 0) > 0, f"средний результат > 0R после комиссий (сейчас {avg_r_txt})"),
+        (st['pf'] >= 1.2, f"профит-фактор ≥ 1.2 (сейчас {pf_txt})"),
+        (st['max_dd'] < MAX_DRAWDOWN_STOP, f"просадка < {MAX_DRAWDOWN_STOP * 100:.0f}% (сейчас {st['max_dd'] * 100:.1f}%)"),
+    ]
+    return [f"{'✅' if ok else '❌'} {html.escape(t)}" for ok, t in checks], all(ok for ok, _ in checks)
+
+
+def _format_results(days: int = 0) -> str:
+    rows = _closed_positions(days)
+    equity = float(getattr(balance_service, 'last_total_equity', None) or balance_service.get_deposit_usdt() or 0)
+    title = "всё время" if days <= 0 else f"{days} дн."
+    lines = [f"🏁 <b>Результаты ({title})</b>"]
+    if not rows:
+        lines.append("")
+        lines.append("Закрытых сделок пока нет. Статистика появится после первых закрытий.")
+        return "\n".join(lines)
+
+    groups = {'FUNNEL': '🧭 Воронка', 'TREND': '🐢 Тренд'}
+    total = _stats(rows, equity)
+    for key, label in groups.items():
+        part = [r for r in rows if (r.get('strategy') or 'FUNNEL') == key]
+        if not part:
+            continue
+        st = _stats(part, equity)
+        pf = '∞' if st['pf'] == float('inf') else f"{st['pf']:.2f}"
+        avg_r = 'n/a' if st['avg_r'] is None else f"{st['avg_r']:+.2f}R"
+        lines += ["", f"<b>{label}</b>",
+                  f"├ Сделок: <code>{st['n']}</code>, прибыльных <code>{st['win_rate'] * 100:.0f}%</code>",
+                  f"├ Итог: <b>{_usd(st['pnl'], sign=True)}</b> | средний <code>{avg_r}</code>",
+                  f"├ Профит-фактор: <code>{pf}</code>",
+                  f"├ Лучшая / худшая: <code>{_usd(st['best'], sign=True)}</code> / <code>{_usd(st['worst'], sign=True)}</code>",
+                  f"└ Макс. просадка по сделкам: <code>{st['max_dd'] * 100:.1f}%</code>, убытков подряд сейчас: <code>{st['streak']}</code>"]
+
+    checks, ready = _readiness(total)
+    lines += ["", "<b>Готовность к реальным деньгам</b> (по всем сделкам):"] + checks
+    lines.append("")
+    if ready:
+        lines.append("✅ Критерии выполнены. Порядок перехода — в DEPLOY_GUIDE.md, раздел «Переход на реальные деньги».")
+    else:
+        lines.append("⏳ Пока рано: продолжайте на демо и сравните с бэктестом (<code>python -m bot.backtest</code>).")
+    return "\n".join(lines)
+
+
+def _results_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Всё время", callback_data="tg:results")
+    kb.button(text="30 дней", callback_data="tg:results:30")
+    kb.button(text="7 дней", callback_data="tg:results:7")
+    kb.button(text="⬅️ Меню", callback_data="tg:menu")
+    kb.adjust(3, 1)
+    return kb
 
 
 # ----------------------------------------------------------------- 🧭 Сигналы
@@ -972,12 +1111,7 @@ def create_router(controller=None) -> Router:
             await _send_text(message, "✅ Ошибок нет", reply_markup=kb.as_markup())
             return
         lines = ["⚠️ <b>Последние ошибки</b>"]
-        for e in items:
-            lines.append(
-                html.escape(
-                    f"{e.get('timestamp','')} | {e.get('module','')} | {e.get('error_type','')} | {e.get('message','')}"
-                )
-            )
+        lines.extend(_format_error_lines(items))
         await _send_text(message, "\n".join(lines), reply_markup=kb.as_markup())
 
     @router.message(Command("pnl"))
@@ -1006,6 +1140,12 @@ def create_router(controller=None) -> Router:
             await _send_text(message, "✅ Reconcile завершён", reply_markup=kb.as_markup())
         except Exception as e:
             await _send_text(message, f"❌ Ошибка reconcile: {e}", reply_markup=kb.as_markup())
+
+    @router.message(Command("results"))
+    async def cmd_results(message: Message) -> None:
+        if not _is_allowed_message(message):
+            return
+        await _send_text(message, await _bg(_format_results, 0), reply_markup=_results_kb().as_markup())
 
     @router.message(Command("signals"))
     async def cmd_signals(message: Message) -> None:
@@ -1071,11 +1211,7 @@ def create_router(controller=None) -> Router:
                 await _send_text_cb(callback, "✅ Ошибок нет", reply_markup=srv_kb)
                 return
             lines = ["⚠️ <b>Последние ошибки ({0})</b>".format(len(items))]
-            for e in items:
-                ts = str(e.get('timestamp', ''))[-8:]
-                mod = e.get('module', '')
-                msg = e.get('message', '')
-                lines.append(f"<code>{ts}</code> | {html.escape(mod)} | {html.escape(msg[:80])}")
+            lines.extend(_format_error_lines(items))
             await _send_text_cb(callback, "\n".join(lines), reply_markup=srv_kb)
         elif data == "tg:reconcile":
             srv_kb = _service_kb().as_markup()
@@ -1204,6 +1340,12 @@ def create_router(controller=None) -> Router:
                 await _send_text_cb(callback, _format_settings_text(controller), reply_markup=_settings_kb(controller).as_markup())
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка: {e}", reply_markup=_settings_kb(controller).as_markup())
+        elif data == "tg:results" or data.startswith("tg:results:"):
+            try:
+                days = int(data.split(":")[2]) if data.count(":") == 2 else 0
+            except Exception:
+                days = 0
+            await _send_text_cb(callback, await _bg(_format_results, days), reply_markup=_results_kb().as_markup())
         elif data == "tg:signals":
             await _send_text_cb(callback, await _bg(_format_signals, controller), reply_markup=_signals_kb().as_markup())
         elif data == "tg:positions":

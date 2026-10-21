@@ -432,7 +432,7 @@ class PositionService:
                       triggerPrice=self._format_price(pair, new_sl))
         if new_qty is not None:
             params['qty'] = self._format_qty(pair, new_qty)
-        for extra in ({}, {"orderFilter": "StopOrder"}, {"orderFilter": "tpslOrder"}):
+        for extra in ({"orderFilter": "StopOrder"}, {}, {"orderFilter": "tpslOrder"}):
             try:
                 resp = self.client.amend_order(**params, **extra)
             except Exception as e:
@@ -463,6 +463,8 @@ class PositionService:
         if not TRAILING_ENABLED:
             return []
         for pos in self.trades_repo.get_open_positions():
+            if pos.get('strategy') == 'TREND':
+                continue  # у тренда свой трейлинг по дневным свечам (trend_service)
             pair = pos['pair']
             price = float(pos.get('current_price') or 0)
             if price <= 0:
@@ -696,7 +698,7 @@ class PositionService:
             return []
         messages = []
         for pos in self.trades_repo.get_open_positions():
-            if pos.get('breakeven_activated') or pos.get('partial_taken'):
+            if pos.get('breakeven_activated') or pos.get('partial_taken') or pos.get('strategy') == 'TREND':
                 continue
             price = float(pos.get('current_price') or 0)
             if price <= 0:
@@ -733,8 +735,8 @@ class PositionService:
         messages = []
         now = datetime.now(TIMEZONE)
         for pos in self.trades_repo.get_open_positions():
-            if pos.get('partial_taken'):
-                continue  # после TP1 остаток защищён безубытком и трейлингом
+            if pos.get('partial_taken') or pos.get('strategy') == 'TREND':
+                continue  # после TP1 остаток защищён безубытком и трейлингом; тренд держится долго
             price = float(pos.get('current_price') or 0)
             if price <= 0:
                 continue
@@ -762,131 +764,185 @@ class PositionService:
                 logger.error(f"❌ Ошибка time exit {pos['pair']}: {e}")
         return messages
     
+    async def place_stop_order(self, pair: str, qty: float, sl_price: float, position_id: int) -> tuple:
+        """
+        Поставить стоп-лосс как условный спот-ордер orderFilter=StopOrder:
+        по документации Bybit он НЕ блокирует монеты до срабатывания, поэтому
+        не мешает другим ордерам и не даёт «Insufficient balance».
+        Returns: (ok, order_id | текст ошибки)
+        """
+        try:
+            resp = self.client.place_order(
+                category="spot", symbol=pair, side="Sell", orderType="Market",
+                qty=self._format_qty(pair, qty), triggerPrice=self._format_price(pair, sl_price),
+                orderFilter="StopOrder", marketUnit="baseCoin",
+            )
+        except Exception as e:
+            return False, str(e)
+        if resp.get('retCode') != 0:
+            return False, f"{resp.get('retMsg')} (ErrCode: {resp.get('retCode')})"
+        order_id = resp['result']['orderId']
+        now = datetime.now(TIMEZONE).isoformat()
+        self.trades_repo.create_order({
+            'order_id': order_id, 'pair': pair, 'side': 'Sell', 'order_type': 'Market',
+            'price': sl_price, 'quantity': qty, 'status': 'Untriggered', 'is_sl': True,
+            'position_id': position_id, 'created_at': now, 'updated_at': now,
+        })
+        self.trades_repo.set_position_tpsl(position_id, sl_price=sl_price)
+        return True, order_id
+
+    async def _cancel_tp_orders(self, position_id: int) -> int:
+        """Снять лимитные тейки позиции (старые версии ставили их на бирже — они блокировали монеты)."""
+        from ..db.connection import get_db
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT order_id, pair FROM orders WHERE position_id = ? AND is_tp = 1
+                  AND status IN ('New', 'PartiallyFilled', 'Untriggered', 'Triggered', 'Active')
+            """, (position_id,)).fetchall()
+        n = 0
+        for r in rows:
+            if self._cancel_any_filter(r['pair'], r['order_id']):
+                self.trades_repo.update_order_status(r['order_id'], 'Cancelled')
+                n += 1
+        return n
+
     async def auto_create_missing_sl(self) -> List[str]:
         """
-        Автоматически создать SL ордера для позиций без них.
-        Синхронизирует qty в БД с реальным балансом на бирже.
-        
-        Returns: Список сообщений о созданных ордерах
+        Поставить SL позициям, у которых его нет. Количество — не больше, чем в позиции
+        (монеты других стратегий не трогаем) и не больше реального баланса.
+        «Insufficient balance» больше НЕ закрывает позицию в БД: монеты на месте,
+        их держат ордера — снимаем лимитные тейки и пробуем снова, иначе предупреждаем.
         """
         messages = []
-        open_positions = self.trades_repo.get_open_positions()
-        
-        for pos in open_positions:
+        for pos in self.trades_repo.get_open_positions():
             pair = pos['pair']
             position_id = pos['id']
-            
-            # Проверяем, есть ли уже SL ордер
-            sl_order = self.trades_repo.get_sl_order(position_id)
-            if sl_order:
-                continue  # SL уже есть
-            
-            logger.info(f"🔧 AUTO-SL: проверяю {pair} (позиция #{position_id})")
-            
-            # Нет SL - создаём
-            db_quantity = pos['quantity']
-            sl_price = pos['sl_price']
-            
-            if not sl_price or sl_price <= 0:
-                # Если SL не задан, рассчитаем от текущей цены (-1%)
-                current_price = pos.get('current_price') or pos['entry_price']
+            if self.trades_repo.get_sl_order(position_id):
+                continue
+
+            db_quantity = float(pos['quantity'])
+            sl_price = float(pos.get('sl_price') or 0)
+            current_price = float(pos.get('current_price') or pos['entry_price'])
+            if sl_price <= 0:
                 sl_price = current_price * 0.99
-            
+
             try:
-                # Проверяем реальный баланс
-                actual_balance = self._get_actual_balance(pair)
-                logger.debug(f"  Баланс {pair}: DB={db_quantity:.6f}, биржа={actual_balance:.6f}")
-                
+                actual_balance = self._get_actual_balance(pair)   # walletBalance монеты
                 if actual_balance < 0:
-                    # Ошибка получения баланса
                     logger.warning(f"⚠️ AUTO-SL {pair}: не удалось получить баланс")
                     continue
-                
-                # Минимальное количество для SL (примерно $10)
-                min_qty_value = 10.0
-                current_price = pos.get('current_price') or pos['entry_price']
-                min_qty = min_qty_value / current_price if current_price > 0 else 0
-                
+
+                min_qty = 10.0 / current_price if current_price > 0 else 0
                 if actual_balance < min_qty:
-                    # Баланса совсем нет - закрываем позицию в БД
-                    logger.warning(
-                        f"⚠️ AUTO-SL {pair}: баланс меньше минимума "
-                        f"({actual_balance:.6f} < {min_qty:.6f}). Закрываем позицию в БД."
-                    )
+                    logger.warning(f"⚠️ AUTO-SL {pair}: монет на балансе нет ({actual_balance:.6f}) — "
+                                   f"позиция закрыта вне бота, закрываю в БД")
                     self._close_position_with_pnl(position_id, pair, current_price, 0)
-                    messages.append(f"🗑️ Позиция {pair} закрыта (нет баланса)")
+                    messages.append(f"🗑️ Позиция {pair} закрыта в БД: монет на бирже нет")
                     continue
-                
-                # Если реальный баланс отличается от БД - синхронизируем
-                if actual_balance < db_quantity * 0.95:  # Отклонение > 5%
-                    logger.info(
-                        f"📊 AUTO-SL {pair}: обновляю qty в БД "
-                        f"({db_quantity:.6f} → {actual_balance:.6f})"
-                    )
-                    # Обновляем quantity в позиции
-                    self.trades_repo.update_position_quantity(position_id, actual_balance)
-                    db_quantity = actual_balance
-                
-                # Форматируем qty
-                formatted_qty = self._format_qty(pair, actual_balance)
-                
-                # Создаём SL ордер (рыночный с триггером)
-                sl_response = self.client.place_order(
-                    category="spot",
-                    symbol=pair,
-                    side="Sell",
-                    orderType="Market",
-                    qty=formatted_qty,
-                    triggerPrice=self._format_price(pair, sl_price),
-                    marketUnit="baseCoin"
-                )
-                
-                if sl_response['retCode'] == 0:
-                    sl_order_id = sl_response['result']['orderId']
-                    
-                    # Сохраняем в БД
-                    self.trades_repo.create_order({
-                        'order_id': sl_order_id,
-                        'pair': pair,
-                        'side': 'Sell',
-                        'order_type': 'Market',
-                        'price': sl_price,
-                        'quantity': actual_balance,
-                        'status': 'New',
-                        'is_sl': True,
-                        'position_id': position_id,
-                        'created_at': datetime.now(TIMEZONE).isoformat(),
-                        'updated_at': datetime.now(TIMEZONE).isoformat()
-                    })
-                    
-                    # Обновляем sl_price в позиции
-                    self.trades_repo.set_position_tpsl(position_id, sl_price=sl_price)
-                    
-                    msg = f"✅ AUTO-SL создан: {pair} qty={formatted_qty} @ {sl_price:.6g}"
+
+                qty = min(db_quantity, actual_balance)
+                if qty < db_quantity * 0.95:
+                    logger.info(f"📊 AUTO-SL {pair}: количество в БД {db_quantity:.6f} → {qty:.6f} (баланс)")
+                    self.trades_repo.update_position_quantity(position_id, qty)
+
+                ok, info = await self.place_stop_order(pair, qty, sl_price, position_id)
+                if not ok and ('170131' in info or 'Insufficient' in info):
+                    freed = await self._cancel_tp_orders(position_id)
+                    if freed:
+                        ok, info = await self.place_stop_order(pair, qty, sl_price, position_id)
+
+                if ok:
+                    msg = f"✅ AUTO-SL создан: {pair} qty={self._format_qty(pair, qty)} @ {sl_price:.6g}"
                     logger.info(msg)
                     messages.append(msg)
                 else:
-                    error_msg = sl_response.get('retMsg', 'Unknown error')
-                    logger.error(f"❌ Ошибка создания SL {pair}: {error_msg}")
-                    
-                    # Если ошибка Insufficient balance - закрываем позицию в БД
-                    if 'Insufficient balance' in error_msg or sl_response['retCode'] == 170131:
-                        logger.warning(f"⚠️ Закрываем позицию {pair} в БД (баланс недоступен)")
-                        self._close_position_with_pnl(position_id, pair, current_price, 0)
-                        messages.append(f"🗑️ Позиция {pair} закрыта (баланс недоступен)")
-                    
+                    error_tracker.add_error("Bybit", "AutoSLError", f"{pair}: {info}")
+                    messages.append(f"⚠️ {pair}: не удалось поставить стоп ({info[:120]}). "
+                                    f"Позиция под защитой аварийного стопа бота; проверьте ордера на Bybit.")
             except Exception as e:
-                error_str = str(e)
-                error_tracker.add_error("Bybit", "AutoSLError", error_str)
-                logger.error(f"❌ Ошибка auto SL {pair}: {e}")
-                
-                # Если ошибка Insufficient balance - закрываем позицию в БД
-                if 'Insufficient balance' in error_str or '170131' in error_str:
-                    logger.warning(f"⚠️ Закрываем позицию {pair} в БД (баланс недоступен)")
-                    self._close_position_with_pnl(position_id, pair, current_price, 0)
-                    messages.append(f"🗑️ Позиция {pair} закрыта (баланс недоступен)")
-        
+                error_tracker.add_error("Bybit", "AutoSLError", f"{pair}: {e}")
         return messages
+
+    async def rebuild_protection(self) -> List[str]:
+        """
+        Однократно при старте v2.6: у открытых позиций снять лимитные тейки
+        (они блокировали монеты, из-за чего стоп не ставился или не мог исполниться)
+        и переставить стоп как StopOrder. Тейки дальше ведёт бот (check_take_profits).
+        """
+        messages = []
+        for pos in self.trades_repo.get_open_positions():
+            pair, pid = pos['pair'], pos['id']
+            removed = await self._cancel_tp_orders(pid)
+            sl = self.trades_repo.get_sl_order(pid)
+            if sl:
+                if self._cancel_any_filter(pair, sl['order_id']):
+                    self.trades_repo.update_order_status(sl['order_id'], 'Cancelled')
+            qty = min(float(pos['quantity']), max(0.0, self._get_actual_balance(pair)))
+            sl_price = float(pos.get('sl_price') or 0) or float(pos['entry_price']) * 0.99
+            if qty > 0:
+                ok, info = await self.place_stop_order(pair, qty, sl_price, pid)
+                messages.append(f"🔧 {pair}: тейков снято {removed}, стоп переставлен "
+                                f"{'✅' if ok else '⚠️ ' + info[:80]}")
+        return messages
+
+    async def check_take_profits(self) -> List[str]:
+        """
+        Тейки ведёт бот: при цене ≥ TP1 продаёт часть позиции по рынку, при цене ≥ TP2 —
+        остаток. На Bybit спот без VIP комиссия maker = taker = 0.1%, так что по комиссии
+        это то же самое, что лимитка, но монеты не заблокированы и стоп всегда может исполниться.
+        """
+        from config.trading_config import EXIT_PARTIAL_FRACTION
+        messages = []
+        for pos in self.trades_repo.get_open_positions():
+            if (pos.get('strategy') or 'FUNNEL') == 'TREND':
+                continue  # у трендовой стратегии нет тейка — выход только по трейлингу
+            price = float(pos.get('current_price') or 0)
+            if price <= 0:
+                continue
+            pair, pid = pos['pair'], pos['id']
+            qty = float(pos['quantity'])
+            tp1 = float(pos.get('tp1_price') or 0)
+            tp2 = float(pos.get('tp_price') or 0)
+            if tp2 > 0 and price >= tp2:
+                sell_qty, label = qty, "TP"
+            elif EXIT_PARTIAL_ENABLED and tp1 > 0 and not pos.get('partial_taken') and price >= tp1:
+                sell_qty, label = qty * EXIT_PARTIAL_FRACTION, "TP1"
+                if sell_qty * price < 5.0 or (qty - sell_qty) * price < 5.0:
+                    continue   # части меньше минимального ордера — ждём полный тейк
+            else:
+                continue
+            filled, avg, fee = await self._market_sell(pair, sell_qty)
+            if filled <= 0:
+                messages.append(f"⚠️ {pair}: не удалось продать по тейку {label} — повторю")
+                continue
+            msg = await self._handle_exit_fill({'position_id': pid, 'is_tp': True}, 'Filled', filled, avg, fee)
+            if msg:
+                messages.append(msg)
+        return messages
+
+    async def _market_sell(self, pair: str, qty: float) -> tuple:
+        """Рыночная продажа; (исполнено, средняя цена, комиссия в USDT)."""
+        try:
+            resp = self.client.place_order(category="spot", symbol=pair, side="Sell", orderType="Market",
+                                           qty=self._format_qty(pair, qty), marketUnit="baseCoin")
+        except Exception as e:
+            error_tracker.add_error("Bybit", "TPSellError", f"{pair}: {e}")
+            return 0.0, 0.0, 0.0
+        if resp.get('retCode') != 0:
+            error_tracker.add_error("Bybit", "TPSellError", f"{pair}: {resp.get('retMsg')}")
+            return 0.0, 0.0, 0.0
+        order_id = resp['result']['orderId']
+        for _ in range(10):
+            await asyncio.sleep(1)
+            try:
+                r = self.client.get_order_history(category="spot", symbol=pair, orderId=order_id)
+                items = (r.get('result') or {}).get('list') or []
+                if items and items[0].get('orderStatus') in ('Filled', 'PartiallyFilledCanceled', 'Cancelled', 'Rejected'):
+                    it = items[0]
+                    return float(it.get('cumExecQty') or 0), float(it.get('avgPrice') or 0), float(it.get('cumExecFee') or 0)
+            except Exception:
+                continue
+        return 0.0, 0.0, 0.0
 
 
 # Глобальный экземпляр

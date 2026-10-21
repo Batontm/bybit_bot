@@ -333,13 +333,14 @@ DEFAULT_GRID = [
 
 
 def walk_forward(data, pairs, *, start_ts: int, end_ts: int, folds: int = 4, grid: Optional[List[Dict]] = None,
-                 min_train_trades: int = 15, equity: float = 10_000.0, log=print, **run_kw) -> Dict:
+                 min_train_trades: int = 15, equity: float = 10_000.0, log=print, runner=None, **run_kw) -> Dict:
     """
     Делим период на folds+1 равных отрезков. Для каждого шага: подбираем параметры
     из сетки на всех предыдущих отрезках (train), проверяем на следующем (test).
     Итог — только по test-отрезкам: это и есть оценка «на невиданных данных».
     """
     grid = grid or DEFAULT_GRID
+    runner = runner or run
     seg = (end_ts - start_ts) // (folds + 1)
     oos_trades: List[Trade] = []
     steps = []
@@ -349,13 +350,13 @@ def walk_forward(data, pairs, *, start_ts: int, end_ts: int, folds: int = 4, gri
         best, best_score, best_m = None, -1e9, None
         for params in grid:
             with override(params):
-                m = metrics(run(data, pairs, start_ts=tr_lo, end_ts=tr_hi, equity=equity, **run_kw))
+                m = metrics(runner(data, pairs, start_ts=tr_lo, end_ts=tr_hi, equity=equity, **run_kw))
             # критерий: средний R при достаточном числе сделок (устойчивее профит-фактора)
             score = m['avg_r'] if m['trades'] >= min_train_trades else -1e6 + m['trades']
             if score > best_score:
                 best, best_score, best_m = params, score, m
         with override(best):
-            test_res = run(data, pairs, start_ts=te_lo, end_ts=te_hi, equity=equity, **run_kw)
+            test_res = runner(data, pairs, start_ts=te_lo, end_ts=te_hi, equity=equity, **run_kw)
         tm = metrics(test_res)
         oos_trades.extend(test_res.trades)
         steps.append({'train': (tr_lo, tr_hi), 'test': (te_lo, te_hi), 'params': best,
@@ -371,3 +372,81 @@ def walk_forward(data, pairs, *, start_ts: int, end_ts: int, folds: int = 4, gri
         'oos_profit_factor': (sum(t.pnl for t in oos_trades if t.pnl > 0) /
                               max(1e-9, -sum(t.pnl for t in oos_trades if t.pnl <= 0))) if n else 0.0,
     }
+
+
+# ----------------------------------------------------------------- трендовая стратегия (D1)
+
+TREND_GRID = [
+    {'TREND_BREAKOUT_DAYS': b, 'TREND_TRAIL_ATR': t}
+    for b in (20, 55) for t in (2.5, 3.0, 4.0)
+]
+
+
+def run_trend(data: Dict[str, Dict[str, List[dict]]], pairs: Iterable[str], *,
+              start_ts: int, end_ts: int, equity: float = 10_000.0, use_guard: bool = True, **_ignored) -> Result:
+    """Трендовая стратегия на дневных свечах (склеенных из 4h). Вход по закрытию дня, стоп внутри дня."""
+    from bot.services import trend_strategy as T
+    slip = cfg.SLIPPAGE_ESTIMATE
+    D1 = T.D1
+    pairs = [p for p in pairs if p in data]
+    days = {p: T.daily_from_4h(data[p]['240']) for p in pairs}
+    res = Result(start_equity=equity)
+    open_pos: Dict[str, dict] = {}
+    timeline = sorted({d['start'] + D1 for p in pairs for d in days[p] if start_ts <= d['start'] + D1 <= end_ts})
+    peak = equity
+
+    def close(pair, pos, price, t, kind):
+        nonlocal equity
+        fee = cfg.TRADING_FEE_RATE
+        pnl = price * pos['qty'] * (1 - fee) - pos['entry'] * pos['qty'] * (1 + fee)
+        equity += pnl
+        res.trades.append(Trade(pair=pair, opened_ts=pos['opened'], closed_ts=t, entry=pos['entry'],
+                                stop=pos['initial_stop'], qty=pos['qty'], risk_usd=pos['risk_usd'], pnl=pnl,
+                                r_multiple=pnl / pos['risk_usd'] if pos['risk_usd'] else 0.0, exit_kind=kind,
+                                trigger='breakout', pullback_ok=False, rs_ok=False, score=0))
+
+    for t in timeline:
+        for pair in pairs:
+            hist = [d for d in days[pair] if d['start'] + D1 <= t]
+            if not hist or hist[-1]['start'] + D1 != t:
+                continue
+            today = hist[-1]
+            pos = open_pos.get(pair)
+            if pos:
+                if today['low'] <= pos['stop']:
+                    close(pair, pos, min(pos['stop'], today['open']) * (1 - slip), t, 'trail_stop'
+                          if pos['stop'] > pos['initial_stop'] else 'stop')
+                    del open_pos[pair]
+                else:
+                    pos['highest'] = max(pos['highest'], today['close'])
+                    atr = T.daily_atr(hist[-60:]) or pos['atr']
+                    pos['stop'] = T.chandelier_stop(pos['stop'], pos['highest'], atr)
+                continue
+            if res.halted_at is not None or len(open_pos) >= cfg.TREND_MAX_POSITIONS:
+                continue
+            ok, info = T.entry_signal(hist[-(cfg.TREND_FILTER_EMA + 60):])
+            if not ok:
+                continue
+            res.signals_seen += 1
+            entry, stop = today['close'] * (1 + slip), info['stop']
+            qty = X.position_size(equity, cfg.TREND_RISK_PER_TRADE, entry, stop)
+            qty = min(qty, equity * 0.98 / entry)
+            if qty * entry < cfg.MIN_ORDER_SIZE_USD:
+                continue
+            open_pos[pair] = {'entry': entry, 'stop': stop, 'initial_stop': stop, 'qty': qty, 'opened': t,
+                              'highest': today['close'], 'atr': info['atr'],
+                              'risk_usd': qty * (entry - stop + X.cost_per_unit(entry))}
+        mark = equity + sum((_last_close(days[p], t) - pos['entry']) * pos['qty'] for p, pos in open_pos.items())
+        res.equity_curve.append((t, mark))
+        peak = max(peak, mark)
+        if use_guard and res.halted_at is None and peak > 0 and 1 - mark / peak >= cfg.MAX_DRAWDOWN_STOP:
+            res.halted_at = t
+
+    for pair, pos in open_pos.items():
+        close(pair, pos, _last_close(days[pair], end_ts), end_ts, 'end')
+    return res
+
+
+def _last_close(days: List[dict], t: int) -> float:
+    i = bisect.bisect_right([d['start'] + 86_400_000 for d in days], t)
+    return days[max(0, i - 1)]['close'] if days else 0.0

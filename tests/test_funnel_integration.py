@@ -159,6 +159,13 @@ def _trading(monkeypatch, client):
     from bot.services.instrument_info import InstrumentInfo
     monkeypatch.setattr(ts_module, 'instrument_info', InstrumentInfo(client=client))
     monkeypatch.setattr(ts_module, 'FUNNEL_LIMIT_TIMEOUT_SEC', 1)
+    # стоп ставит position_service — тем же фейковым клиентом
+    from bot.services import position_service as psm
+    from bot.services.position_service import PositionService
+    ps = PositionService.__new__(PositionService)
+    ps.client, ps.trades_repo = client, svc.trades_repo
+    monkeypatch.setattr(psm, 'position_service', ps)
+    monkeypatch.setattr(psm, 'instrument_info', InstrumentInfo(client=client))
     return svc
 
 
@@ -175,13 +182,13 @@ async def test_open_with_plan_limit_post_only(monkeypatch):
     from bot.services.exit_rules import cost_per_unit
     risk = (pos['entry_price'] - pos['sl_price'] + cost_per_unit(pos['entry_price'])) * pos['quantity']
     assert risk == pytest.approx(50.0, rel=0.02)          # 0.5% капитала ВКЛЮЧАЯ комиссии
-    # тейки: TP1 на половину позиции + TP2
-    tps = [kw for _, kw in client.orders if kw['side'] == 'Sell' and kw['orderType'] == 'Limit']
-    assert len(tps) == 2 and float(tps[0]['price']) < float(tps[1]['price'])
+    # на бирже только стоп (StopOrder); тейки TP1/TP2 записаны в позицию и их ведёт бот
+    assert not [kw for _, kw in client.orders if kw['side'] == 'Sell' and kw['orderType'] == 'Limit']
+    assert pos['tp1_price'] and pos['tp1_price'] < pos['tp_price']
     # количество за вычетом комиссии в монете, TP/SL поставлены
     assert pos['quantity'] < float(buy['qty'])
     sells = [kw for _, kw in client.orders if kw['side'] == 'Sell']
-    assert len(sells) == 3                                  # TP1, TP2, SL
+    assert len(sells) == 1 and sells[0]['orderFilter'] == 'StopOrder'   # только стоп
 
 
 async def test_open_with_plan_not_filled_cancels(monkeypatch):

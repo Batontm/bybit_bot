@@ -7,6 +7,7 @@ CLI бэктестера.
   python -m bot.backtest --pairs BTCUSDT,ETHUSDT --no-walk-forward
   python -m bot.backtest --require-pullback       # брать только входы с откатом 1h
   python -m bot.backtest --offline                # только кэш, без загрузки
+  python -m bot.backtest --strategy trend         # только трендовая стратегия (D1)
 
 Результаты: data/backtest/<дата>/ — report.md, trades.csv, summary.json
 """
@@ -66,20 +67,38 @@ def _fmt_breakdown(title: str, b: dict) -> list:
     return lines
 
 
-def verdict(m: dict, wf: dict | None) -> list:
+def _fmt_wf(wf, fmt_d) -> list:
+    if not wf:
+        return []
+    lines = ["### Walk-forward (проверка на невиданных данных)", "",
+             "Параметры подбираются на прошлом, проверяются на следующем отрезке. "
+             "Только эти цифры честно оценивают стратегию.", "",
+             "| Шаг | Лучшие параметры на train | train: сделок / avgR | test: сделок / avgR |",
+             "|---|---|---|---|"]
+    for i, s in enumerate(wf['steps'], 1):
+        p = ", ".join(f"{k}={v}" for k, v in s['params'].items())
+        lines.append(f"| {i} ({fmt_d(s['test'][0])} — {fmt_d(s['test'][1])}) | {p} | "
+                     f"{s['train_metrics']['trades']} / {s['train_metrics']['avg_r']:+.2f} | "
+                     f"{s['test_metrics']['trades']} / {s['test_metrics']['avg_r']:+.2f} |")
+    lines += ["", f"**Итого на test-отрезках:** {wf['oos_trades']} сделок, средний {wf['oos_avg_r']:+.2f}R, "
+                  f"прибыльных {wf['oos_win_rate'] * 100:.0f}%, профит-фактор {wf['oos_profit_factor']:.2f}", ""]
+    return lines
+
+
+def verdict(m: dict, wf: dict | None, min_trades: int = 50) -> list:
     """Простые критерии из плана перехода на реальные деньги."""
     src = wf if wf else None
     avg_r = src['oos_avg_r'] if src else m['avg_r']
     pf = src['oos_profit_factor'] if src else m['profit_factor']
     n = src['oos_trades'] if src else m['trades']
     checks = [
-        (n >= 50, f"сделок на проверке ≥ 50 (сейчас {n})"),
+        (n >= min_trades, f"сделок на проверке ≥ {min_trades} (сейчас {n})"),
         (avg_r > 0, f"средний результат после комиссий > 0R (сейчас {avg_r:+.2f}R)"),
         (pf >= 1.2, f"профит-фактор ≥ 1.2 (сейчас {pf:.2f})"),
         (m['max_drawdown'] < cfg.MAX_DRAWDOWN_STOP, f"просадка < {cfg.MAX_DRAWDOWN_STOP * 100:.0f}% "
                                                    f"(сейчас {m['max_drawdown'] * 100:.1f}%)"),
     ]
-    lines = ["## Вывод", ""]
+    lines = ["### Вывод", ""]
     for ok, text in checks:
         lines.append(f"- {'✅' if ok else '❌'} {text}")
     passed = all(ok for ok, _ in checks)
@@ -101,68 +120,94 @@ def main(argv=None) -> int:
     ap.add_argument("--require-rs", action="store_true", help="входить только если монета сильнее BTC")
     ap.add_argument("--no-guard", action="store_true", help="без паузы после убытков и стопа по просадке")
     ap.add_argument("--offline", action="store_true", help="не качать, использовать только кэш")
+    ap.add_argument("--strategy", choices=("funnel", "trend", "both"), default="both",
+                    help="какую стратегию проверять (по умолчанию обе)")
     ap.add_argument("--out", default=None, help="папка для отчёта (по умолчанию data/backtest/<дата>)")
     args = ap.parse_args(argv)
 
     pairs = [p.strip().upper() for p in args.pairs.split(",") if p.strip()]
-    print(f"🧪 Бэктест: {len(pairs)} пар, {args.days} дней, комиссия {cfg.TRADING_FEE_RATE * 100:.2f}%")
+    do_funnel = args.strategy in ("funnel", "both")
+    do_trend = args.strategy in ("trend", "both")
+    load_pairs = list(dict.fromkeys((pairs if do_funnel else []) + (list(cfg.TREND_PAIRS) if do_trend else [])))
+    print(f"🧪 Бэктест: {args.strategy}, {len(load_pairs)} пар, {args.days} дней, комиссия {cfg.TRADING_FEE_RATE * 100:.2f}%")
     t0 = time.time()
-    data = load_dataset(pairs, args.days, offline=args.offline)
+    # тренду нужен длинный прогрев: EMA100 по дневным свечам
+    data = load_dataset(load_pairs, args.days, offline=args.offline, warmup_days=160 if do_trend else 60)
     pairs = [p for p in pairs if data.get(p, {}).get("15")]
-    if not pairs or not data.get('BTCUSDT', {}).get('240'):
+    trend_pairs = [p for p in cfg.TREND_PAIRS if data.get(p, {}).get("240")]
+    if not data.get('BTCUSDT', {}).get('240') or (do_funnel and not pairs and not do_trend):
         print("❌ Нет данных (проверьте сеть или кэш data/klines)")
         return 1
 
     end_ts = data['BTCUSDT']['15'][-1]['start'] + E.M15
     start_ts = end_ts - args.days * 86_400_000
     kw = dict(require_pullback=args.require_pullback, require_rs=args.require_rs, use_guard=not args.no_guard)
-
-    print("⚙️ Прогон с текущими настройками...")
-    res = E.run(data, pairs, start_ts=start_ts, end_ts=end_ts, equity=args.equity, **kw)
-    m = E.metrics(res)
-
-    wf = None
-    if not args.no_walk_forward and args.folds >= 2:
-        print(f"🔁 Walk-forward: {args.folds} шагов, сетка {len(E.DEFAULT_GRID)} вариантов...")
-        wf = E.walk_forward(data, pairs, start_ts=start_ts, end_ts=end_ts, folds=args.folds,
-                            equity=args.equity, **kw)
-
     fmt_d = lambda ts: datetime.fromtimestamp(ts / 1000, timezone.utc).strftime('%Y-%m-%d')
+
     lines = [
-        "# Бэктест воронки входа",
+        "# Бэктест стратегий",
         "",
-        f"Период: {fmt_d(start_ts)} — {fmt_d(end_ts)} ({args.days} дн.), пары: {', '.join(pairs)}",
-        f"Капитал {args.equity:,.0f} USDT, риск на сделку {cfg.MAX_RISK_PER_TRADE * 100:.2f}%, "
-        f"комиссия {cfg.TRADING_FEE_RATE * 100:.2f}% + проскальзывание {cfg.SLIPPAGE_ESTIMATE * 100:.2f}%",
-        f"Выходы: TP1 {cfg.EXIT_PARTIAL_FRACTION * 100:.0f}% на +{cfg.EXIT_PARTIAL_R}R "
-        f"({'вкл' if cfg.EXIT_PARTIAL_ENABLED else 'выкл'}), тейк +{cfg.FUNNEL_TP_R}R, безубыток +{cfg.EXIT_BREAKEVEN_R}R, "
-        f"трейлинг {cfg.EXIT_TRAIL_ATR_MULT}×ATR, выход по времени {cfg.EXIT_TIME_HOURS} ч",
-        "",
-        "> Проверяется ценовая часть воронки (светофор, тренд, откат, триггер, стоп, выходы). "
-        "Стакан, поток сделок, OI и funding в истории недоступны — их вклад оценивается на демо.",
+        f"Период: {fmt_d(start_ts)} — {fmt_d(end_ts)} ({args.days} дн.)",
+        f"Капитал {args.equity:,.0f} USDT, комиссия {cfg.TRADING_FEE_RATE * 100:.2f}% + проскальзывание "
+        f"{cfg.SLIPPAGE_ESTIMATE * 100:.2f}%",
         "",
     ]
-    lines += _fmt_metrics("Весь период, текущие настройки", m)
-    lines += _fmt_breakdown("По наличию отката 1h", E.breakdown(res.trades, lambda t: 'откат был' if t.pullback_ok else 'без отката'))
-    lines += _fmt_breakdown("По силе к BTC", E.breakdown(res.trades, lambda t: 'сильнее BTC' if t.rs_ok else 'слабее BTC'))
-    lines += _fmt_breakdown("По типу триггера", E.breakdown(res.trades, lambda t: t.trigger or '—'))
-    lines += _fmt_breakdown("По парам", E.breakdown(res.trades, lambda t: t.pair))
+    res = None
+    m = None
+    wf = None
+    summary = {}
 
-    if wf:
-        lines += ["## Walk-forward (проверка на невиданных данных)", "",
-                  "Параметры подбираются на прошлом, проверяются на следующем отрезке. "
-                  "Только эти цифры честно оценивают стратегию.", "",
-                  "| Шаг | Лучшие параметры на train | train: сделок / avgR | test: сделок / avgR |",
-                  "|---|---|---|---|"]
-        for i, s in enumerate(wf['steps'], 1):
-            p = ", ".join(f"{k}={v}" for k, v in s['params'].items())
-            lines.append(f"| {i} ({fmt_d(s['test'][0])} — {fmt_d(s['test'][1])}) | {p} | "
-                         f"{s['train_metrics']['trades']} / {s['train_metrics']['avg_r']:+.2f} | "
-                         f"{s['test_metrics']['trades']} / {s['test_metrics']['avg_r']:+.2f} |")
-        lines += ["", f"**Итого на test-отрезках:** {wf['oos_trades']} сделок, средний {wf['oos_avg_r']:+.2f}R, "
-                      f"прибыльных {wf['oos_win_rate'] * 100:.0f}%, профит-фактор {wf['oos_profit_factor']:.2f}", ""]
+    if do_funnel and pairs:
+        print("⚙️ Воронка: прогон с текущими настройками...")
+        res = E.run(data, pairs, start_ts=start_ts, end_ts=end_ts, equity=args.equity, **kw)
+        m = E.metrics(res)
+        if not args.no_walk_forward and args.folds >= 2:
+            print(f"🔁 Воронка: walk-forward {args.folds} шагов, сетка {len(E.DEFAULT_GRID)} вариантов...")
+            wf = E.walk_forward(data, pairs, start_ts=start_ts, end_ts=end_ts, folds=args.folds,
+                                equity=args.equity, **kw)
+        lines += [
+            "## Воронка (внутридневная)", "",
+            f"Пары: {', '.join(pairs)}. Риск на сделку {cfg.MAX_RISK_PER_TRADE * 100:.2f}%.",
+            f"Выходы: TP1 {cfg.EXIT_PARTIAL_FRACTION * 100:.0f}% на +{cfg.EXIT_PARTIAL_R}R "
+            f"({'вкл' if cfg.EXIT_PARTIAL_ENABLED else 'выкл'}), тейк +{cfg.FUNNEL_TP_R}R, безубыток +{cfg.EXIT_BREAKEVEN_R}R, "
+            f"трейлинг {cfg.EXIT_TRAIL_ATR_MULT}×ATR, выход по времени {cfg.EXIT_TIME_HOURS} ч", "",
+            "> Проверяется ценовая часть воронки (светофор, тренд, откат, триггер, стоп, выходы). "
+            "Стакан, поток сделок, OI и funding в истории недоступны — их вклад оценивается на демо.", "",
+        ]
+        lines += _fmt_metrics("Весь период, текущие настройки", m)
+        lines += _fmt_breakdown("По наличию отката 1h", E.breakdown(res.trades, lambda t: 'откат был' if t.pullback_ok else 'без отката'))
+        lines += _fmt_breakdown("По силе к BTC", E.breakdown(res.trades, lambda t: 'сильнее BTC' if t.rs_ok else 'слабее BTC'))
+        lines += _fmt_breakdown("По типу триггера", E.breakdown(res.trades, lambda t: t.trigger or '—'))
+        lines += _fmt_breakdown("По парам", E.breakdown(res.trades, lambda t: t.pair))
+        lines += _fmt_wf(wf, fmt_d)
+        lines += verdict(m, wf)
+        summary['funnel'] = {'metrics': m, 'walk_forward': {k: v for k, v in (wf or {}).items() if k != 'steps'}}
 
-    lines += verdict(m, wf)
+    if do_trend and trend_pairs:
+        print("🐢 Тренд: прогон...")
+        tres = E.run_trend(data, trend_pairs, start_ts=start_ts, end_ts=end_ts, equity=args.equity,
+                           use_guard=not args.no_guard)
+        tm = E.metrics(tres)
+        twf = None
+        if not args.no_walk_forward and args.folds >= 2:
+            print(f"🔁 Тренд: walk-forward {args.folds} шагов...")
+            twf = E.walk_forward(data, trend_pairs, start_ts=start_ts, end_ts=end_ts, folds=args.folds,
+                                 equity=args.equity, grid=E.TREND_GRID, runner=E.run_trend,
+                                 min_train_trades=3, use_guard=not args.no_guard)
+        lines += [
+            "## Тренд (дневные свечи)", "",
+            f"Пары: {', '.join(trend_pairs)}. Вход — пробой {cfg.TREND_BREAKOUT_DAYS}-дн. максимума выше "
+            f"EMA{cfg.TREND_FILTER_EMA}; стоп {cfg.TREND_STOP_ATR}×ATR; выход — трейлинг {cfg.TREND_TRAIL_ATR}×ATR. "
+            f"Риск на сделку {cfg.TREND_RISK_PER_TRADE * 100:.2f}%.", "",
+            "> Сделок мало, поэтому статистика за год шумная: смотрите и на доходность, и на просадку.", "",
+        ]
+        lines += _fmt_metrics("Весь период, текущие настройки", tm)
+        lines += _fmt_breakdown("По парам", E.breakdown(tres.trades, lambda t: t.pair))
+        lines += _fmt_wf(twf, fmt_d)
+        lines += verdict(tm, twf, min_trades=15)
+        summary['trend'] = {'metrics': tm, 'walk_forward': {k: v for k, v in (twf or {}).items() if k != 'steps'}}
+        if res is None:
+            res, m = tres, tm
 
     out = Path(args.out) if args.out else Path(__file__).resolve().parents[2] / "data" / "backtest" / \
         datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -172,11 +217,10 @@ def main(argv=None) -> int:
         w = csv.writer(f)
         w.writerow(["pair", "opened_utc", "closed_utc", "entry", "stop", "qty", "risk_usd", "pnl", "r",
                     "exit", "trigger", "pullback", "rs", "score"])
-        for t in res.trades:
+        for t in (res.trades if res else []):
             w.writerow([t.pair, fmt_d(t.opened_ts), fmt_d(t.closed_ts), f"{t.entry:.8g}", f"{t.stop:.8g}",
                         f"{t.qty:.8g}", f"{t.risk_usd:.2f}", f"{t.pnl:.2f}", f"{t.r_multiple:.3f}",
                         t.exit_kind, t.trigger, int(t.pullback_ok), int(t.rs_ok), t.score])
-    summary = {'metrics': m, 'walk_forward': {k: v for k, v in (wf or {}).items() if k != 'steps'}}
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
     print("\n".join(lines))

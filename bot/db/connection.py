@@ -217,6 +217,9 @@ class DatabaseConnection:
         _add_column("positions", "tp1_price", "tp1_price REAL")
         _add_column("positions", "partial_taken", "partial_taken INTEGER DEFAULT 0")
         _add_column("positions", "partial_pnl", "partial_pnl REAL DEFAULT 0")
+        # v2.6: стратегия и риск сделки в $ (для экрана результатов и R-статистики)
+        _add_column("positions", "strategy", "strategy TEXT DEFAULT 'FUNNEL'")
+        _add_column("positions", "risk_usd", "risk_usd REAL")
 
         conn.commit()
     

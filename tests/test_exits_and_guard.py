@@ -135,28 +135,6 @@ async def test_stop_after_tp1_labelled_as_protected():
     assert s.trades_repo.get_position_by_id(pid)['realized_pnl'] > 0
 
 
-def test_tp_orders_split(monkeypatch):
-    from bot.services.trading_service import TradingService
-    from bot.services import trading_service as ts
-    from bot.services.instrument_info import InstrumentInfo
-    from bot.db.trades_repo import TradesRepository
-
-    class IC:
-        def get_instruments_info(self, **kw):
-            return {'retCode': 0, 'result': {'list': [{'lotSizeFilter': {'basePrecision': '0.001'},
-                                                       'priceFilter': {'tickSize': '0.01'}}]}}
-    monkeypatch.setattr(ts, 'instrument_info', InstrumentInfo(client=IC()))
-    t = TradingService.__new__(TradingService)
-    t.client = _AmendClient()
-    t.trades_repo = TradesRepository()
-    import asyncio
-    asyncio.run(t._place_tp_sl_orders('SPLITUSDT', 1.0, 105.0, 98.0, 1, tp1_price=103.0))
-    limits = [o for o in t.client.orders if o['orderType'] == 'Limit']
-    assert [(o['price'], o['qty']) for o in limits] == [('103', '0.5'), ('105', '0.5')]
-    sl = [o for o in t.client.orders if o.get('triggerPrice')][0]
-    assert sl['qty'] == '1'
-
-
 # ----------------------------------------------------------------- защита счёта
 
 def _closed_trade(repo, pnl, minutes_ago):

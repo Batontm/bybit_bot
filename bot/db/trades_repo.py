@@ -213,8 +213,8 @@ class TradesRepository:
                 INSERT INTO positions (
                     pair, entry_price, quantity, current_price,
                     tp_price, sl_price, status, opened_at, slippage, commission_paid,
-                    initial_sl, entry_atr, tp1_price
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    initial_sl, entry_atr, tp1_price, strategy, risk_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position_data['pair'],
                 position_data['entry_price'],
@@ -229,6 +229,8 @@ class TradesRepository:
                 position_data.get('initial_sl', position_data.get('sl_price')),
                 position_data.get('entry_atr'),
                 position_data.get('tp1_price'),
+                position_data.get('strategy') or 'FUNNEL',
+                position_data.get('risk_usd'),
             ))
             
             position_id = cursor.lastrowid

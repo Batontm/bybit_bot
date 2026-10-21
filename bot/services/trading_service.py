@@ -36,6 +36,8 @@ from config.trading_config import (
     DCA_MIN_SCORE,
     DCA_POSITION_MULTIPLIER,
     FUNNEL_LIMIT_TIMEOUT_SEC,
+    TRADING_FEE_RATE,
+    SLIPPAGE_ESTIMATE,
 )
 from ..db.trades_repo import TradesRepository
 from ..db.pnl_repo import PnLRepository
@@ -65,7 +67,7 @@ class TradingService:
         """Форматировать price по тику инструмента."""
         return instrument_info.format_price(pair, price)
     
-    def check_risk_limits(self) -> Tuple[bool, str]:
+    def check_risk_limits(self, strategy: str = "FUNNEL") -> Tuple[bool, str]:
         """
         Проверить все риск-лимиты перед открытием позиции
         Returns: (можно_открывать, причина_если_нет)
@@ -76,15 +78,19 @@ class TradingService:
         if not allowed:
             return False, guard_reason
 
-        # 1. Проверка количества открытых позиций
+        # 1–2. Лимиты слотов — отдельно для каждой стратегии (тренд не занимает места воронки)
         open_positions = self.trades_repo.get_open_positions()
-        if len(open_positions) >= MAX_OPEN_POSITIONS:
-            return False, f"Достигнут лимит открытых позиций ({MAX_OPEN_POSITIONS})"
-        
-        # 2. Проверка количества активных пар
-        active_pairs = set(pos['pair'] for pos in open_positions)
-        if len(active_pairs) >= MAX_ACTIVE_PAIRS:
-            return False, f"Достигнут лимит активных пар ({MAX_ACTIVE_PAIRS})"
+        own = [p for p in open_positions if (p.get('strategy') or 'FUNNEL') == strategy]
+        if strategy == "TREND":
+            from config.trading_config import TREND_MAX_POSITIONS
+            if len(own) >= TREND_MAX_POSITIONS:
+                return False, f"Достигнут лимит трендовых позиций ({TREND_MAX_POSITIONS})"
+        else:
+            if len(own) >= MAX_OPEN_POSITIONS:
+                return False, f"Достигнут лимит открытых позиций ({MAX_OPEN_POSITIONS})"
+            active_pairs = set(pos['pair'] for pos in own)
+            if len(active_pairs) >= MAX_ACTIVE_PAIRS:
+                return False, f"Достигнут лимит активных пар ({MAX_ACTIVE_PAIRS})"
         
         # 3. Проверка дневного лимита новых сделок
         today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
@@ -354,6 +360,33 @@ class TradingService:
             tp1_price=lv.partial, entry_atr=getattr(plan, 'atr', None),
         )
 
+    async def open_trend_position(self, pair: str, stop: float, atr: float) -> Tuple[Optional[Dict], Optional[str]]:
+        """Вход трендовой стратегии: рыночный ордер, стоп за 2×ATR дневной, тейка нет."""
+        from config.trading_config import TREND_RISK_PER_TRADE
+        from .exit_rules import position_size as size_with_costs
+        can_trade, reason = self.check_risk_limits(strategy="TREND")
+        if not can_trade:
+            return None, reason
+        can_open, reason = self.can_open_position_for_pair(pair)
+        if not can_open:
+            return None, reason
+        try:
+            row = self.client.get_tickers(category="spot", symbol=pair)['result']['list'][0]
+            price = float(row.get('ask1Price') or row['lastPrice'])
+        except Exception as e:
+            return None, f"Не удалось получить цену {pair}: {e}"
+        if price <= stop:
+            return None, "цена уже ниже стопа"
+        qty = size_with_costs(balance_service.get_deposit_usdt(), TREND_RISK_PER_TRADE, price, stop)
+        try:
+            free = float(balance_service.get_usdt_balance().get('free', 0))
+            if free > 0 and qty * price > free * 0.98:
+                qty = free * 0.98 / price
+        except Exception:
+            pass
+        return await self._execute_entry(pair, qty, price, 0.0, stop, limit_price=None,
+                                         entry_atr=atr, strategy="TREND")
+
     def risk_fraction(self) -> Tuple[float, str]:
         """
         Доля капитала под риск в сделке. При панике на рынке (ATR BTC 4H выше
@@ -376,7 +409,8 @@ class TradingService:
     async def _execute_entry(self, pair: str, quantity: float, expected_price: float,
                              tp_price: float, sl_price: float, *,
                              limit_price: Optional[float], tp1_price: Optional[float] = None,
-                             entry_atr: Optional[float] = None) -> Tuple[Optional[Dict], Optional[str]]:
+                             entry_atr: Optional[float] = None,
+                             strategy: str = "FUNNEL") -> Tuple[Optional[Dict], Optional[str]]:
         """
         Разместить ордер на покупку, дождаться исполнения и записать позицию
         по ФАКТИЧЕСКОЙ средней цене и количеству (за вычетом комиссии в монете).
@@ -457,6 +491,9 @@ class TradingService:
             'tp_price': tp_price, 'sl_price': sl_price, 'opened_at': now,
             'slippage': slippage, 'commission_paid': fee * avg_price,
             'initial_sl': sl_price, 'entry_atr': entry_atr, 'tp1_price': tp1_price,
+            'strategy': strategy,
+            'risk_usd': net_qty * (avg_price - sl_price) + fee * avg_price + avg_price * net_qty * (
+                TRADING_FEE_RATE + SLIPPAGE_ESTIMATE),
         })
         try:
             from ..db.connection import get_transaction
@@ -527,58 +564,22 @@ class TradingService:
                                    tp_price: float, sl_price: float,
                                    position_id: int, tp1_price: Optional[float] = None) -> None:
         """
-        Разместить защиту позиции:
-          • TP1 — лимит на EXIT_PARTIAL_FRACTION позиции по tp1_price (если включено и
-            обе части не меньше минимального ордера);
-          • TP2 — лимит на остаток по tp_price;
-          • SL — условный рыночный ордер на всё количество (после TP1 объём уменьшается).
+        Защита позиции на бирже — только стоп-лосс как условный ордер orderFilter=StopOrder:
+        он не блокирует монеты до срабатывания (документация Bybit).
+
+        Тейки (TP1 и TP2) на бирже НЕ ставятся: лимитный тейк блокировал все монеты
+        позиции, из-за чего стоп не ставился («Insufficient balance») или не мог
+        исполниться. Тейки ведёт бот (position_service.check_take_profits, каждые 10 с);
+        на споте без VIP комиссия maker = taker = 0.1%, так что по деньгам разницы нет.
         """
-        from config.trading_config import EXIT_PARTIAL_ENABLED, EXIT_PARTIAL_FRACTION
-        now = datetime.now(TIMEZONE).isoformat()
-
-        def save(order_id, price, qty, otype, **flags):
-            self.trades_repo.create_order({
-                'order_id': order_id, 'pair': pair, 'side': 'Sell', 'order_type': otype,
-                'price': price, 'quantity': qty, 'status': 'New', 'position_id': position_id,
-                'created_at': now, 'updated_at': now, **flags,
-            })
-
-        try:
-            parts = [(tp_price, quantity)]
-            if EXIT_PARTIAL_ENABLED and tp1_price and tp1_price < tp_price:
-                q1 = float(self._format_qty(pair, quantity * EXIT_PARTIAL_FRACTION))
-                q2 = float(self._format_qty(pair, quantity - q1))
-                if q1 * tp1_price >= MIN_ORDER_SIZE_USD and q2 * tp_price >= MIN_ORDER_SIZE_USD:
-                    parts = [(tp1_price, q1), (tp_price, q2)]
-                else:
-                    logger.info(f"ℹ️ {pair}: позиция мала для частичной фиксации — один тейк")
-
-            for price, qty in parts:
-                resp = self.client.place_order(
-                    category="spot", symbol=pair, side="Sell", orderType="Limit",
-                    qty=self._format_qty(pair, qty), price=self._format_price(pair, price),
-                    marketUnit="baseCoin",
-                )
-                if resp.get('retCode') == 0:
-                    save(resp['result']['orderId'], price, qty, 'Limit', is_tp=True)
-                    logger.info(f"✅ TP ордер размещён: {pair} {qty} @ {price}")
-                else:
-                    logger.error(f"❌ TP {pair} @ {price}: {resp.get('retMsg')}")
-
-            sl_response = self.client.place_order(
-                category="spot", symbol=pair, side="Sell", orderType="Market",
-                qty=self._format_qty(pair, quantity),
-                triggerPrice=self._format_price(pair, sl_price), marketUnit="baseCoin",
-            )
-            if sl_response.get('retCode') == 0:
-                save(sl_response['result']['orderId'], sl_price, quantity, 'Market', is_sl=True)
-                logger.info(f"✅ SL ордер размещён: {pair} @ {sl_price}")
-            else:
-                logger.error(f"❌ SL {pair}: {sl_response.get('retMsg')} — подхватит Auto-SL")
-
-        except Exception as e:
-            error_tracker.add_error("Bybit", "TPSLError", str(e))
-            logger.error(f"❌ Ошибка размещения TP/SL: {e}")
+        from .position_service import position_service
+        ok, info = await position_service.place_stop_order(pair, quantity, sl_price, position_id)
+        if ok:
+            logger.info(f"✅ SL {pair} @ {sl_price} (StopOrder); тейки ведёт бот: "
+                        f"TP1 {tp1_price or '—'}, TP {tp_price}")
+        else:
+            error_tracker.add_error("Bybit", "SLError", f"{pair}: {info}")
+            logger.error(f"❌ SL {pair}: {info} — повторит Auto-SL через 2 мин, до этого защищает аварийный стоп бота")
     
     def get_add_action(self, position: Dict) -> Optional[str]:
         """
@@ -586,7 +587,7 @@ class TradingService:
         (Метод вызывается контроллером каждые 2 минуты; до v2.2 его не было,
         задача падала с AttributeError, и докупки не работали вообще.)
         """
-        if not (PYRAMIDING_ENABLED or DCA_ENABLED):
+        if not (PYRAMIDING_ENABLED or DCA_ENABLED) or position.get('strategy') == 'TREND':
             return None
         if position.get('breakeven_activated'):
             return None
