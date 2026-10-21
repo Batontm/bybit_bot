@@ -43,6 +43,31 @@ def _write_cache(path: Path, rows: Dict[int, dict]) -> None:
     tmp.replace(path)
 
 
+def _get_kline_retry(client, symbol: str, interval: str, lo: int, cursor_end: int, log,
+                     attempts: int = 5) -> dict:
+    """
+    Запрос страницы свечей с повторами. Bybit иногда отвечает «internal error»
+    (10016/10006/10002) — это временный сбой, повторяем с паузой; с 3-й попытки
+    запрашиваем без start (только end+limit): он короче и реже падает.
+    """
+    last = None
+    for i in range(attempts):
+        params = dict(category="spot", symbol=symbol, interval=interval, end=cursor_end, limit=1000)
+        if i < 2:
+            params['start'] = lo
+        try:
+            resp = client.get_kline(**params)
+            if resp.get('retCode') == 0:
+                return resp
+            last = RuntimeError(f"{symbol} {interval}: {resp.get('retMsg')} ({resp.get('retCode')})")
+        except Exception as e:   # pybit бросает InvalidRequestError / сетевые ошибки
+            last = e
+        wait = 2 * (i + 1)
+        log(f"  ⚠️ {symbol} {interval}: ошибка Bybit, повтор через {wait} с ({str(last)[:80]})")
+        time.sleep(wait)
+    raise RuntimeError(f"{symbol} {interval}: не удалось скачать свечи после {attempts} попыток: {last}")
+
+
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int, *, client=None,
                  cache_dir: Optional[Path] = None, offline: bool = False,
                  log=print) -> List[dict]:
@@ -72,10 +97,12 @@ def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int, *, clie
         for lo, hi in need_ranges:
             cursor_end = hi - 1
             while cursor_end >= lo:
-                resp = client.get_kline(category="spot", symbol=symbol, interval=interval,
-                                        start=lo, end=cursor_end, limit=1000)
-                if resp.get('retCode') != 0:
-                    raise RuntimeError(f"{symbol} {interval}: {resp.get('retMsg')}")
+                try:
+                    resp = _get_kline_retry(client, symbol, interval, lo, cursor_end, log)
+                except Exception:
+                    if added:
+                        _write_cache(path, rows)   # не теряем уже скачанное
+                    raise
                 batch = (resp.get('result') or {}).get('list') or []
                 if not batch:
                     break
@@ -107,7 +134,12 @@ def load_dataset(pairs: List[str], days: int, *, warmup_days: int = 60, client=N
     data: Dict[str, Dict[str, List[dict]]] = {}
     for pair in dict.fromkeys(['BTCUSDT'] + list(pairs)):
         log(f"📥 {pair}...")
-        data[pair] = {tf: fetch_klines(pair, tf, start_ms, end_ms, client=client, cache_dir=cache_dir,
-                                       offline=offline, log=log)
-                      for tf in ("15", "60", "240")}
+        try:
+            data[pair] = {tf: fetch_klines(pair, tf, start_ms, end_ms, client=client, cache_dir=cache_dir,
+                                           offline=offline, log=log)
+                          for tf in ("15", "60", "240")}
+        except Exception as e:
+            if pair == 'BTCUSDT':
+                raise   # без BTC бэктест невозможен
+            log(f"  ⚠️ {pair} пропущена: {e}")
     return data

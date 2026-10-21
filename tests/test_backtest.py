@@ -242,3 +242,36 @@ def test_cli_trend_only(dataset, tmp_path, monkeypatch):
     assert cli.main(["--days", "60", "--strategy", "trend", "--folds", "2", "--out", str(out)]) == 0
     report = (out / "report.md").read_text(encoding="utf-8")
     assert "## Тренд" in report and "### Вывод" in report
+
+
+def test_fetch_klines_retries_bybit_internal_error(tmp_path, monkeypatch):
+    from bot.backtest import data as bd
+    monkeypatch.setattr(bd.time, 'sleep', lambda s: None)
+    step = 15 * 60_000
+    now = int(bd.time.time() * 1000)
+    end = now - now % step
+    calls = []
+
+    class Flaky:
+        def get_kline(self, **kw):
+            calls.append(kw)
+            if len(calls) <= 2:
+                raise RuntimeError("internal error (ErrCode: 10016)")
+            s = end - step
+            return {'retCode': 0, 'result': {'list': [[str(s), '1', '2', '0.5', '1.5', '10', '15']]}}
+
+    rows = bd.fetch_klines('BTCUSDT', '15', end - step, end, client=Flaky(), cache_dir=tmp_path, log=lambda m: None)
+    assert len(rows) == 1 and len(calls) == 3
+    assert 'start' not in calls[2]          # третий повтор — без start
+
+
+def test_load_dataset_skips_failing_pair(tmp_path, monkeypatch):
+    from bot.backtest import data as bd
+
+    def fake(pair, tf, *a, **k):
+        if pair == 'BADUSDT':
+            raise RuntimeError('boom')
+        return []
+    monkeypatch.setattr(bd, 'fetch_klines', fake)
+    d = bd.load_dataset(['BADUSDT', 'ETHUSDT'], 5, cache_dir=tmp_path, log=lambda m: None)
+    assert set(d) == {'BTCUSDT', 'ETHUSDT'}
