@@ -10,7 +10,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config.api_config import TELEGRAM_ALLOWED_USER_IDS
 from config.settings import LOG_FILE
-from config.trading_config import ARBITRAGE_POSITION_SIZE_USD
+from config.trading_config import ARBITRAGE_POSITION_SIZE_USD, ENTRY_STRATEGY, MAX_TOTAL_RISK
 from bot.error_tracker import error_tracker
 from bot.db.trades_repo import TradesRepository
 from bot.db.daily_pnl_repo import DailyPnLRepository
@@ -18,6 +18,58 @@ from bot.controller import BOT_VERSION
 from bot.services.balance_service import balance_service
 from bot.services.arbitrage_service import arbitrage_service
 from bot.services.market_regime_service import market_regime_service
+
+
+def _price(v: float) -> str:
+    """Цена с точностью по величине: $67,123.45 / $1.2345 / $0.0001234."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "n/a"
+    if v == 0:
+        return "$0"
+    a = abs(v)
+    if a >= 1000:
+        return f"${v:,.2f}"
+    if a >= 1:
+        return f"${v:,.4f}".rstrip('0').rstrip('.')
+    return f"${v:.8f}".rstrip('0').rstrip('.') if a < 0.0001 else f"${v:.6f}".rstrip('0').rstrip('.')
+
+
+def _usd(v: float, sign: bool = False) -> str:
+    """Сумма в долларах: -$12.34 / +$5.00 (знак перед $)."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "n/a"
+    s = "-" if v < 0 else ("+" if sign and v > 0 else "")
+    return f"{s}${abs(v):,.2f}"
+
+
+def _qty(v: float) -> str:
+    """Количество монет без лишних нулей."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "n/a"
+    if v == 0:
+        return "0"
+    s = f"{v:,.8f}" if abs(v) < 1 else f"{v:,.4f}"
+    return s.rstrip('0').rstrip('.')
+
+
+def _total_equity_usd(balances: list) -> float:
+    """Капитал в USD: totalEquity аккаунта, иначе сумма usdValue по монетам."""
+    eq = getattr(balance_service, 'last_total_equity', None)
+    if eq:
+        return float(eq)
+    total = 0.0
+    for b in balances:
+        v = float(b.get('usd_value') or 0)
+        if not v and str(b.get('coin', '')).upper() in ('USDT', 'USDC'):
+            v = float(b.get('total') or 0)
+        total += v
+    return total
 
 
 def _is_allowed_user_id(user_id: Optional[int]) -> bool:
@@ -38,12 +90,12 @@ def _is_allowed_callback(callback: CallbackQuery) -> bool:
 
 def _main_menu_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
-    kb.button(text="� Дашборд", callback_data="tg:health")
+    kb.button(text="📊 Дашборд", callback_data="tg:health")
     kb.button(text="🚦 Режим", callback_data="tg:regime")
-    kb.button(text=" PnL", callback_data="tg:pnl")
+    kb.button(text="📈 PnL", callback_data="tg:pnl")
     kb.button(text="💹 Арбитраж", callback_data="tg:arbitrage")
     kb.button(text="⚙️ Настройки", callback_data="tg:settings")
-    kb.button(text="� Сервис", callback_data="tg:service")
+    kb.button(text="🛠 Сервис", callback_data="tg:service")
     kb.button(text="🛑 PANIC SELL", callback_data="tg:panic_confirm")
     kb.adjust(2, 2, 2, 1)
     return kb
@@ -64,8 +116,14 @@ def _settings_kb(controller) -> InlineKeyboardBuilder:
                 alerts = bool(controller.is_alerts_enabled())
         except Exception:
             pass
+    mode = controller.get_mode() if controller is not None and hasattr(controller, 'get_mode') else None
+    if mode == "PAUSED":
+        kb.button(text="▶️ Возобновить работу (сейчас пауза)", callback_data="tg:resume")
+    else:
+        kb.button(text="⏸ Пауза (сопровождение позиций тоже)", callback_data="tg:pause")
     kb.button(text=f"🤖 Авто-торговля: {'ON' if auto else 'OFF'}", callback_data="tg:toggle_auto_trading")
-    kb.button(text=f"🔍 Сканер: {'ON' if scanner else 'OFF'}", callback_data="tg:toggle_scanner")
+    if ENTRY_STRATEGY != "FUNNEL":
+        kb.button(text=f"🔍 Сканер: {'ON' if scanner else 'OFF'}", callback_data="tg:toggle_scanner")
     kb.button(text=f"🔔 Уведомления: {'ON' if notif else 'OFF'}", callback_data="tg:toggle_notifications")
     kb.button(text=f"🚨 Алерты: {'ON' if alerts else 'OFF'}", callback_data="tg:toggle_alerts")
     kb.button(text="⬅️ Назад", callback_data="tg:menu")
@@ -103,8 +161,16 @@ def _format_settings_text(controller) -> str:
 
     lines = ["⚙️ <b>Настройки</b>"]
     lines.append("")
+    try:
+        mode = controller.get_mode() if controller is not None else None
+        lines.append(f"Режим: <b>{ {'ACTIVE': '🟢 работает', 'RISK_ONLY': '🟡 только сопровождение', 'PAUSED': '🔴 пауза'}.get(mode, mode) }</b>")
+    except Exception:
+        pass
     lines.append(f"🤖 Авто-торговля: <b>{_st(auto)}</b>")
-    lines.append(f"🔍 Сканер: <b>{_st(scanner)}</b>")
+    if ENTRY_STRATEGY == "FUNNEL":
+        lines.append("🧭 Стратегия входа: <b>воронка</b> (пары отбираются автоматически)")
+    else:
+        lines.append(f"🔍 Сканер Top Gainers: <b>{_st(scanner)}</b>")
     lines.append(f"🔔 Уведомления: <b>{_st(notif)}</b>")
     lines.append(f"🚨 Алерты: <b>{_st(alerts)}</b>")
     return "\n".join(lines)
@@ -124,35 +190,12 @@ def _format_arbitrage_pnl_summary() -> str:
         lines.append(f"Открыто позиций: {open_positions}")
         lines.append(f"Закрыто позиций: {closed_positions}")
         lines.append("")
-        lines.append(f"Funding (открытые): ${open_funding:.2f}")
-        lines.append(f"Реализовано (закрытые): ${closed_pnl:.2f}")
-        lines.append(f"Итого: <b>${total:.2f}</b>")
+        lines.append(f"Funding (открытые): {_usd(open_funding, sign=True)}")
+        lines.append(f"Реализовано (закрытые): {_usd(closed_pnl, sign=True)}")
+        lines.append(f"Итого: <b>{_usd(total, sign=True)}</b>")
         return "\n".join(lines)
     except Exception as e:
         return f"💹 <b>Арбитраж PnL</b>\n\n❌ Ошибка: {html.escape(str(e))}"
-
-
-def _format_market_preview() -> str:
-    st = market_regime_service.get_status()
-    if st.price is None or st.ema200_4h is None or st.rsi14_4h is None:
-        return "Рынок (BTC 4H): неизвестно"
-
-    above = st.price > st.ema200_4h
-    rsi_up = st.rsi14_4h >= 50
-
-    if above and rsi_up:
-        label = "БЫЧИЙ"
-        emoji = "🟢"
-    elif (not above) and (not rsi_up):
-        label = "МЕДВЕЖИЙ"
-        emoji = "🔴"
-    else:
-        label = "ФЛЭТ/СМЕШАННЫЙ"
-        emoji = "🟡"
-
-    return (
-        f"{emoji} Рынок (BTC 4H): <b>{label}</b> | Цена={st.price:.2f} | EMA200={st.ema200_4h:.2f} | RSI14={st.rsi14_4h:.2f}"
-    )
 
 
 def _format_balances_block(max_rows: int = 5) -> str:
@@ -164,27 +207,33 @@ def _format_balances_block(max_rows: int = 5) -> str:
     if not balances:
         return "💰 <b>Баланс (Unified)</b>\nНет данных"
 
-    try:
-        balances = sorted(balances, key=lambda b: float(b.get('total') or 0), reverse=True)
-    except Exception:
-        pass
+    total_usd = _total_equity_usd(balances)
+    usdt = next((b for b in balances if str(b.get('coin', '')).upper() == 'USDT'), {})
+    usdt_free = float(usdt.get('free') or 0)
 
-    grand_total = sum(float(b.get('usd_value') or b.get('total') or 0) for b in balances)
-    grand_free = sum(float(b.get('free') or 0) for b in balances if str(b.get('coin', '')).upper() == 'USDT')
+    def usd_of(b):
+        v = float(b.get('usd_value') or 0)
+        if not v and str(b.get('coin', '')).upper() in ('USDT', 'USDC'):
+            v = float(b.get('total') or 0)
+        return v
+
+    balances = sorted(balances, key=usd_of, reverse=True)
+    visible = [b for b in balances if usd_of(b) >= 1.0]
+    dust = [b for b in balances if usd_of(b) < 1.0]
 
     lines = ["💰 <b>Баланс (Unified)</b>"]
-    lines.append(f"├ Total: <b>${grand_total:,.2f}</b>")
-    lines.append(f"└ Available: <b>${grand_free:,.2f}</b> (USDT)")
+    lines.append(f"├ Всего: <b>{_usd(total_usd)}</b>")
+    lines.append(f"└ Свободно USDT: <b>{_usd(usdt_free)}</b>")
 
-    shown = balances[: max(1, int(max_rows))]
-    if len(shown) > 0:
+    shown = visible[: max(1, int(max_rows))]
+    if shown:
         lines.append("")
         for i, b in enumerate(shown):
             coin = str(b.get('coin') or '')
-            total = float(b.get('total') or 0)
-            free = float(b.get('free') or 0)
-            prefix = "└" if i == len(shown) - 1 else "├"
-            lines.append(f"{prefix} {html.escape(coin)}: <code>{total:.4f}</code> (free: {free:.4f})")
+            prefix = "└" if i == len(shown) - 1 and not dust else "├"
+            lines.append(f"{prefix} {html.escape(coin)}: <code>{_qty(float(b.get('total') or 0))}</code> ≈ {_usd(usd_of(b))}")
+    if dust:
+        lines.append(f"└ мелкие остатки (&lt; $1), монет: {len(dust)}")
     return "\n".join(lines)
 
 
@@ -195,29 +244,34 @@ def _format_open_positions_block(max_rows: int = 10) -> str:
         positions = []
 
     if not positions:
-        return "� <b>Активные позиции</b>\nНет открытых"
+        return "📂 <b>Активные позиции</b>\nНет открытых"
 
-    lines = [f"� <b>Активные позиции ({len(positions)})</b>"]
+    lines = [f"📂 <b>Активные позиции ({len(positions)})</b>"]
     for p in positions[: max(1, int(max_rows))]:
         pair = str(p.get('pair') or '')
         coin = pair.replace('USDT', '')
-        cur = float(p.get('current_price') or p.get('entry_price') or 0)
-        pnl_pct = p.get('unrealized_pnl_percent')
-        try:
-            pnl_pct_f = float(pnl_pct) if pnl_pct is not None else None
-        except Exception:
-            pnl_pct_f = None
-        if pnl_pct_f is not None:
-            pnl_emoji = "🟩" if pnl_pct_f >= 0 else "🟥"
-            pnl_sign = "+" if pnl_pct_f >= 0 else ""
-            pnl_txt = f"<code>{pnl_sign}{pnl_pct_f:.2f}%</code>"
+        entry = float(p.get('avg_entry_price') or p.get('entry_price') or 0)
+        cur = float(p.get('current_price') or entry or 0)
+        qty = float(p.get('quantity') or 0)
+        pnl_pct = (cur - entry) / entry * 100 if entry > 0 else None
+        pnl_usd = (cur - entry) * qty
+        if pnl_pct is not None:
+            pnl_emoji = "🟩" if pnl_pct >= 0 else "🟥"
+            pnl_txt = f"<code>{pnl_pct:+.2f}%</code> ({_usd(pnl_usd, sign=True)})"
         else:
-            pnl_emoji = "⬜️"
-            pnl_txt = "<code>n/a</code>"
-        lines.append(f"{pnl_emoji} {html.escape(coin)}: {pnl_txt} | ${cur:,.2f}")
+            pnl_emoji, pnl_txt = "⬜️", "<code>n/a</code>"
+        lines.append(f"{pnl_emoji} <b>{html.escape(coin)}</b>: {pnl_txt}")
+        lines.append(f"   {_price(entry)} → {_price(cur)}")
+        sl, tp = p.get('sl_price'), p.get('tp_price')
+        parts = []
+        if sl:
+            parts.append(f"SL {_price(float(sl))}")
+        if tp:
+            parts.append(f"TP {_price(float(tp))}")
+        if parts:
+            lines.append("   " + " | ".join(parts))
 
     return "\n".join(lines)
-
 
 
 def _format_regime() -> str:
@@ -231,22 +285,24 @@ def _format_regime() -> str:
     lines.append(f"Статус: {emoji} <b>{label}</b> ({trade_hint})")
 
     if st.price is not None and st.ema200_4h is not None and st.rsi14_4h is not None:
+        rsi_min = market_regime_service.RSI_MIN
+        atr_max = market_regime_service.ATR_SPIKE_MULTIPLIER
         cond_price = st.price > st.ema200_4h
-        cond_rsi = st.rsi14_4h >= 50
+        cond_rsi = st.rsi14_4h >= rsi_min
         atr_ratio = st.atr_ratio
-        cond_atr = (atr_ratio is not None and atr_ratio < 2.0) if atr_ratio is not None else True
+        cond_atr = atr_ratio is None or atr_ratio <= atr_max
 
         lines.append("")
         lines.append("<b>Показатели:</b>")
         lines.append(
-            f"├ Цена: <code>{st.price:,.2f}</code> (Target &gt; {st.ema200_4h:,.2f}) {'✅' if cond_price else '❌'}"
+            f"├ Цена: <code>{st.price:,.2f}</code> (нужно &gt; EMA200 {st.ema200_4h:,.2f}) {'✅' if cond_price else '❌'}"
         )
         lines.append(
-            f"├ RSI14: <code>{st.rsi14_4h:.2f}</code> (Target &gt; 50) {'✅' if cond_rsi else '❌'}"
+            f"├ RSI14: <code>{st.rsi14_4h:.2f}</code> (нужно ≥ {rsi_min}) {'✅' if cond_rsi else '❌'}"
         )
         if atr_ratio is not None:
             lines.append(
-                f"└ ATR Spike: <code>{atr_ratio:.2f}</code> (Limit &lt; 2.0) {'✅' if cond_atr else '❌'}"
+                f"└ ATR к среднему: <code>{atr_ratio:.2f}×</code> (паника при &gt; {atr_max:.1f}×) {'✅' if cond_atr else '❌'}"
             )
         else:
             lines.append("└ ATR Spike: <code>n/a</code>")
@@ -306,7 +362,7 @@ def _read_last_log_lines(max_lines: int = 80) -> str:
             return f"LOG_FILE не найден: {LOG_FILE}"
 
         with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
+            lines = [ln for ln in f.readlines() if "| DEBUG" not in ln]
         tail = lines[-max_lines:]
         return "".join(tail).strip()
     except Exception as e:
@@ -379,13 +435,36 @@ def _format_health(controller) -> str:
 
     lines = [f"📊 <b>Дашборд системы</b>"]
     lines.append(f"Статус: {mode_emoji} {mode or 'N/A'} | Uptime: <code>{uptime}</code>")
-    lines.append(f"Версия: <code>{BOT_VERSION}</code>")
+    lines.append(f"Версия: <code>{BOT_VERSION}</code> | Стратегия: <code>{ENTRY_STRATEGY}</code>")
+    try:
+        st = market_regime_service.get_status()
+        light = "🟢 вход разрешён" if st.allowed else "🔴 новые входы запрещены"
+        lines.append(f"🚦 Светофор BTC 4H: {light}")
+    except Exception:
+        pass
+    if controller is not None and hasattr(controller, 'is_auto_trading_enabled'):
+        try:
+            if not controller.is_auto_trading_enabled():
+                lines.append("⏸ Авто-торговля выключена (Настройки)")
+        except Exception:
+            pass
 
     lines.append("")
     lines.append(_format_balances_block())
 
     lines.append("")
     lines.append(_format_open_positions_block())
+    try:
+        from bot.services.trading_service import TradingService
+        positions = TradesRepository.get_open_positions()
+        if positions:
+            risk_usd = TradingService.open_risk_usdt(positions)
+            equity = float(balance_service.get_deposit_usdt() or 0)
+            if equity > 0:
+                lines.append(f"🛡 Риск до стопов: <code>{_usd(risk_usd)}</code> "
+                             f"({risk_usd / equity * 100:.2f}% из {MAX_TOTAL_RISK * 100:.0f}% лимита)")
+    except Exception:
+        pass
 
     # арбитраж — компактно
     try:
@@ -400,7 +479,7 @@ def _format_health(controller) -> str:
                 pair = str(ap.get('pair') or '')
                 coin = pair.replace('USDT', '')
                 fund = float(ap.get('accumulated_funding') or 0)
-                lines.append(f"• {html.escape(coin)}(Arb): <code>+${fund:.2f} funding</code>")
+                lines.append(f"• {html.escape(coin)} (арб.): funding <code>{_usd(fund, sign=True)}</code>")
     except Exception:
         pass
 
@@ -422,14 +501,13 @@ def _format_arbitrage_dashboard() -> str:
         closed_pnl = float(stats.get('total_pnl') or 0)
         total = open_funding + closed_pnl
 
-        total_sign = "+" if total >= 0 else ""
         lines = ["💹 <b>Арбитраж — Дашборд</b>"]
         lines.append("")
         lines.append("<b>Статистика:</b>")
         lines.append(f"├ Открыто: <code>{open_pos}</code> | Закрыто: <code>{closed_pos}</code>")
-        lines.append(f"├ Funding (open): <code>+${open_funding:.2f}</code>")
-        lines.append(f"├ PnL (closed): <code>${closed_pnl:.2f}</code>")
-        lines.append(f"└ Итого: <b>{total_sign}${total:.2f}</b>")
+        lines.append(f"├ Funding (открытые): <code>{_usd(open_funding, sign=True)}</code>")
+        lines.append(f"├ PnL (закрытые): <code>{_usd(closed_pnl, sign=True)}</code>")
+        lines.append(f"└ Итого: <b>{_usd(total, sign=True)}</b>")
 
         if positions:
             lines.append("")
@@ -441,7 +519,7 @@ def _format_arbitrage_dashboard() -> str:
                 entry = float(p.get('entry_price') or 0)
                 fund = float(p.get('accumulated_funding') or 0)
                 fund_emoji = "🟩" if fund >= 0 else "🟥"
-                lines.append(f"{fund_emoji} {html.escape(coin)}: <code>{qty:.4f}</code> @ ${entry:.4f} | funding: <code>+${fund:.2f}</code>")
+                lines.append(f"{fund_emoji} {html.escape(coin)}: <code>{_qty(qty)}</code> @ {_price(entry)} | funding: <code>{_usd(fund, sign=True)}</code>")
 
         return "\n".join(lines)
     except Exception as e:
@@ -474,7 +552,7 @@ def _format_arbitrage_analysis(limit: int = 10, position_size: float = 0) -> tup
             # Разрешаем вход только если funding не ниже MIN_FUNDING_RATE сервиса
             allowed = float(o.get("funding_rate") or 0) >= float(getattr(arbitrage_service, "MIN_FUNDING_RATE", 0.0001))
             can = "✅ можно" if allowed else "⛔️ нельзя"
-            lines.append(f"- {risk} <b>{pair}</b> | funding={fr_pct:.4f}% | APY≈{apy:.1f}% | price={mark:.4f} | {can}")
+            lines.append(f"- {html.escape(str(risk))} <b>{html.escape(str(pair))}</b> | funding={fr_pct:.4f}% | APY≈{apy:.1f}% | цена {_price(mark)} | {can}")
 
         return "\n".join(lines), shown
     except Exception as e:
@@ -488,8 +566,7 @@ _arb_user_size: dict[int, float] = {}  # user_id -> selected size in USD
 def _get_default_arb_size() -> float:
     """3% of total deposit, minimum $50, fallback to config value."""
     try:
-        balances = balance_service.get_all_balances() or []
-        grand_total = sum(float(b.get('usd_value') or b.get('total') or 0) for b in balances)
+        grand_total = _total_equity_usd(balance_service.get_all_balances() or [])
         if grand_total > 0:
             size = round(grand_total * 0.03, 2)
             return max(size, 50.0)
@@ -561,8 +638,10 @@ def _format_pnl_summary(days: int = 7) -> str:
             rows = DailyPnLRepository.get_last_days(10000)
         else:
             rows = DailyPnLRepository.get_last_days(days)
+        today_line = _format_today_pnl()
         if not rows:
-            return "📈 <b>PnL</b>\n\nНет данных (пока не было закрытых позиций)."
+            return "📈 <b>PnL</b>\n\n" + (today_line + "\n\n" if today_line else "") + \
+                "Итогов по прошлым дням пока нет (считаются раз в сутки, после 00:00 UTC)."
 
         total_net = sum(float(r.get('net_pnl') or 0) for r in rows)
         total_comm = sum(float(r.get('commission_paid') or 0) for r in rows)
@@ -573,7 +652,6 @@ def _format_pnl_summary(days: int = 7) -> str:
 
         winrate = (total_wins / total_trades * 100) if total_trades > 0 else 0
         avg_pnl = (total_net / total_trades) if total_trades > 0 else 0
-        net_sign = "+" if total_net >= 0 else ""
 
         if days <= 0:
             title = "📈 <b>Статистика PnL (всё время)</b>"
@@ -581,28 +659,46 @@ def _format_pnl_summary(days: int = 7) -> str:
             title = f"📈 <b>Статистика PnL ({len(rows)}д)</b>"
 
         lines = [title]
-        lines.append(f"Net Profit: <b>{net_sign}${total_net:.2f}</b>")
-        lines.append(f"Winrate: <code>{winrate:.0f}%</code> | Trades: <code>{total_trades}</code>")
+        if today_line:
+            lines.append(today_line)
+            lines.append("")
+        lines.append(f"Чистая прибыль: <b>{_usd(total_net, sign=True)}</b>")
+        lines.append(f"Винрейт: <code>{winrate:.0f}%</code> | Сделок: <code>{total_trades}</code>")
 
         lines.append("")
         lines.append("<b>Эффективность:</b>")
-        lines.append(f"├ Avg PnL/trade: <code>${avg_pnl:.2f}</code>")
-        lines.append(f"├ Fees: <code>-${abs(total_comm):.2f}</code>")
-        lines.append(f"└ Slippage: <code>-${abs(total_slip):.2f}</code>")
+        lines.append(f"├ Средний PnL на сделку: <code>{_usd(avg_pnl, sign=True)}</code>")
+        lines.append(f"├ Комиссии: <code>-${abs(total_comm):.2f}</code>")
+        lines.append(f"└ Проскальзывание (сумма по сделкам): <code>{total_slip * 100:.2f}%</code>")
 
         lines.append("")
-        lines.append("📅 <b>Daily:</b>")
-        for r in rows[-15:]:
+        lines.append("📅 <b>По дням (UTC, последние 15):</b>")
+        for r in sorted(rows, key=lambda r: str(r.get('date_utc', '')))[-15:]:
             d = r.get('date_utc', '')
             net = float(r.get('net_pnl') or 0)
             trades = int(r.get('trades_count') or 0)
             day_emoji = "🟩" if net >= 0 else "🟥"
-            net_s = "+" if net >= 0 else ""
-            lines.append(f"{day_emoji} {d}: <code>{net_s}${net:.2f}</code> ({trades} сделок)")
+            lines.append(f"{day_emoji} {html.escape(str(d))}: <code>{_usd(net, sign=True)}</code> (сделок: {trades})")
 
         return "\n".join(lines)
     except Exception as e:
-        return f"📈 <b>PnL</b>\n\n❌ Ошибка: {e}"
+        return f"📈 <b>PnL</b>\n\n❌ Ошибка: {html.escape(str(e))}"
+
+
+def _format_today_pnl() -> str:
+    """Закрытые сегодня (UTC) позиции — без ожидания суточного пересчёта."""
+    try:
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = TradesRepository.get_closed_positions_between_utc(start, now + timedelta(minutes=1))
+        if not rows:
+            return "📅 Сегодня (UTC): закрытых сделок нет"
+        net = sum(float(r.get('net_pnl') or r.get('realized_pnl') or 0) for r in rows)
+        wins = sum(1 for r in rows if float(r.get('net_pnl') or r.get('realized_pnl') or 0) > 0)
+        return f"📅 Сегодня (UTC): <b>{_usd(net, sign=True)}</b> | сделок {len(rows)}, в плюс {wins}"
+    except Exception:
+        return ""
 
 
 def _pnl_kb() -> InlineKeyboardBuilder:
@@ -715,7 +811,7 @@ def create_router(controller=None) -> Router:
             return
         await _send_text(
             message,
-            "� <b>Сервис</b>\n\nВыберите действие:",
+            "🛠 <b>Сервис</b>\n\nВыберите действие:",
             reply_markup=_service_kb().as_markup(),
         )
 
@@ -776,14 +872,14 @@ def create_router(controller=None) -> Router:
         elif data == "tg:service":
             await _send_text_cb(
                 callback,
-                "� <b>Сервис</b>\n\nВыберите действие:",
+                "🛠 <b>Сервис</b>\n\nВыберите действие:",
                 reply_markup=_service_kb().as_markup(),
             )
         elif data == "tg:logs":
             log_text = _read_last_log_lines(50)
             blocks = _format_pre_blocks(log_text, max_len=3500)
             await _send_pre_blocks_cb(callback, blocks)
-            await _send_text_cb(callback, "� Логи отправлены", reply_markup=_service_kb().as_markup())
+            await _send_text_cb(callback, "📋 Логи отправлены", reply_markup=_service_kb().as_markup())
         elif data == "tg:pnl":
             await _send_text_cb(callback, _format_pnl_summary(7), reply_markup=_pnl_kb().as_markup())
         elif data.startswith("tg:pnl:"):
@@ -880,6 +976,12 @@ def create_router(controller=None) -> Router:
                 await _send_text_cb(callback, _format_settings_text(controller), reply_markup=_settings_kb(controller).as_markup())
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка: {e}", reply_markup=_settings_kb(controller).as_markup())
+        elif data in ("tg:pause", "tg:resume"):
+            if controller is None or not hasattr(controller, "set_mode"):
+                await _send_text_cb(callback, "❌ Недоступно", reply_markup=kb)
+                return
+            controller.set_mode("PAUSED" if data == "tg:pause" else "ACTIVE")
+            await _send_text_cb(callback, _format_settings_text(controller), reply_markup=_settings_kb(controller).as_markup())
         elif data == "tg:panic_confirm":
             confirm_kb = InlineKeyboardBuilder()
             confirm_kb.button(text="⚠️ ДА, ЗАКРЫТЬ ВСЁ", callback_data="tg:panic_execute")
@@ -892,7 +994,7 @@ def create_router(controller=None) -> Router:
                 "• Отменит ВСЕ ордера на бирже\n"
                 "• Закроет ВСЕ позиции по рынку\n"
                 "• Закроет ВСЕ арбитражные позиции\n"
-                "• Поставит бота на ПАУЗУ\n\n"
+                "• Поставит бота на ПАУЗУ (снять — Настройки → Возобновить)\n\n"
                 "⚠️ <b>Вы уверены?</b>",
                 reply_markup=confirm_kb.as_markup(),
             )
@@ -906,7 +1008,5 @@ def create_router(controller=None) -> Router:
                 await _send_text_cb(callback, "\n".join(results), reply_markup=kb)
             except Exception as e:
                 await _send_text_cb(callback, f"❌ Ошибка panic sell: {e}", reply_markup=kb)
-        elif data == "tg:menu":
-            await _send_text_cb(callback, "📋 Главное меню", reply_markup=kb)
 
     return router

@@ -61,10 +61,26 @@ class AiogramTelegramBot:
         self.dp = Dispatcher()
         self.dp.include_router(create_router(self.controller))
 
+        try:
+            from aiogram.types import BotCommand
+            await self.bot.set_my_commands([
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="health", description="Дашборд: баланс, позиции, риск"),
+                BotCommand(command="regime", description="Светофор BTC 4H"),
+                BotCommand(command="pnl", description="Статистика PnL"),
+                BotCommand(command="arbitrage", description="Арбитраж"),
+                BotCommand(command="settings", description="Настройки"),
+                BotCommand(command="service", description="Сверка, ошибки, логи"),
+            ])
+        except Exception as e:
+            logger.debug(f"set_my_commands: {e}")
+
         self._polling_task = asyncio.create_task(self.dp.start_polling(self.bot))
         logger.info("✅ Telegram (aiogram) бот запущен")
 
     async def stop(self) -> None:
+        if not self.enabled:
+            return
         if self._polling_task:
             self._polling_task.cancel()
             try:
@@ -102,25 +118,27 @@ class AiogramTelegramBot:
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
+            # Текст с «<» или «&» (например, из ответа биржи) ломает HTML-разметку —
+            # тогда отправляем как обычный текст, чтобы уведомление не потерялось
+            if "parse entities" in str(e).lower() or "unsupported start tag" in str(e).lower():
+                try:
+                    await self.bot.send_message(chat_id=self.chat_id, text=text,
+                                                reply_markup=reply_markup, parse_mode=None)
+                    return
+                except Exception as e2:
+                    e = e2
             logger.error(f"❌ Ошибка отправки сообщения: {e}")
 
     async def send_startup_message(self, startup_checks: dict) -> None:
+        from bot.controller import BOT_VERSION
+        from config.trading_config import ENTRY_STRATEGY
         lines = [
-            "🤖 Bybit bot started",
-            f"Mode: {startup_checks.get('mode', 'UNKNOWN')}",
+            f"🤖 <b>Бот запущен</b> ({BOT_VERSION})",
+            f"Режим: {startup_checks.get('mode', 'UNKNOWN')} | Стратегия: {ENTRY_STRATEGY}",
         ]
-        kb = InlineKeyboardBuilder()
-        kb.button(text="💼 Статус", callback_data="tg:health")
-        kb.button(text="📜 Логи", callback_data="tg:logs")
-        kb.button(text="⚠️ Ошибки", callback_data="tg:errors")
-        kb.button(text="🔁 Сверка", callback_data="tg:reconcile")
-        kb.button(text="📈 PnL", callback_data="tg:pnl")
-        kb.button(text="💹 Арбитраж", callback_data="tg:arbitrage")
-        kb.button(text="🔔 Уведомления", callback_data="tg:notifications")
-        kb.button(text="🚨 Алерты", callback_data="tg:alerts")
-        kb.adjust(2)
-
-        await self.send_message("\n".join(lines), reply_markup=kb.as_markup())
+        # Те же кнопки, что и в главном меню: у каждой есть обработчик
+        from .handlers import _main_menu_kb
+        await self.send_message("\n".join(lines), reply_markup=_main_menu_kb().as_markup())
 
 
 def create_telegram_bot(controller=None) -> AiogramTelegramBot:

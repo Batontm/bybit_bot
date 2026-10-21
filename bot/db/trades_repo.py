@@ -141,13 +141,13 @@ class TradesRepository:
             if pair:
                 cursor.execute("""
                     SELECT * FROM orders 
-                    WHERE status IN ('New', 'PartiallyFilled') AND pair = ?
+                    WHERE status IN ('New', 'PartiallyFilled', 'Untriggered', 'Triggered', 'Active') AND pair = ?
                     ORDER BY created_at DESC
                 """, (pair,))
             else:
                 cursor.execute("""
                     SELECT * FROM orders 
-                    WHERE status IN ('New', 'PartiallyFilled')
+                    WHERE status IN ('New', 'PartiallyFilled', 'Untriggered', 'Triggered', 'Active')
                     ORDER BY created_at DESC
                 """)
             
@@ -160,7 +160,7 @@ class TradesRepository:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT * FROM orders 
-                WHERE position_id = ? AND is_sl = 1 AND status IN ('New', 'PartiallyFilled')
+                WHERE position_id = ? AND is_sl = 1 AND status IN ('New', 'PartiallyFilled', 'Untriggered', 'Triggered', 'Active')
                 ORDER BY created_at DESC
                 LIMIT 1
             """, (position_id,))
@@ -200,7 +200,7 @@ class TradesRepository:
             row = cursor.fetchone()
             if not row:
                 return None
-            return row.get('position_id')
+            return row['position_id']  # sqlite3.Row не имеет .get()
 
     # ========== POSITIONS ==========
     

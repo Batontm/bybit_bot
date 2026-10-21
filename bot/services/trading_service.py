@@ -675,7 +675,7 @@ class TradingService:
             rows = conn.execute("""
                 SELECT order_id, is_tp, is_sl FROM orders
                 WHERE position_id = ? AND (is_tp = 1 OR is_sl = 1)
-                  AND status IN ('New', 'PartiallyFilled', 'Untriggered')
+                  AND status IN ('New', 'PartiallyFilled', 'Untriggered', 'Triggered', 'Active')
             """, (position_id,)).fetchall()
         qty_str = self._format_qty(pair, new_qty)
         for r in rows:

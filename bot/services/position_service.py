@@ -114,10 +114,16 @@ class PositionService:
         except Exception:
             return
 
-    async def sync_orders_and_trades(self, max_orders: int = 50) -> None:
+    async def sync_orders_and_trades(self, max_orders: int = 50) -> List[str]:
+        """
+        Синхронизировать статусы ордеров и исполнения с биржей.
+        Если исполнился TP или SL — закрыть позицию с реальным PnL и отменить
+        второй защитный ордер. Returns: сообщения для уведомлений.
+        """
+        messages: List[str] = []
         open_orders = self.trades_repo.get_open_orders()
         if not open_orders:
-            return
+            return messages
 
         def _parse_dt(value: str) -> datetime:
             try:
@@ -132,6 +138,10 @@ class PositionService:
             if not order_id or not pair:
                 continue
 
+            status = None
+            filled_qty = None
+            avg_price = None
+            exit_fee_usdt = 0.0
             try:
                 order_history = self.client.get_order_history(
                     category="spot",
@@ -164,16 +174,10 @@ class PositionService:
                         if status:
                             self.trades_repo.update_order_status(order_id, status, filled_qty=filled_qty, avg_price=avg_price)
                     else:
-                        open_resp = self.client.get_open_orders(
-                            category="spot",
-                            symbol=pair
-                        )
-
-                        if open_resp.get('retCode') == 0:
-                            open_list = (((open_resp.get('result') or {}).get('list')) or [])
-                            found_open = any((o.get('orderId') == order_id) for o in open_list)
-                            if not found_open:
-                                self.trades_repo.update_order_status(order_id, 'Cancelled')
+                        # в истории нет — проверяем открытые, включая условные SL,
+                        # иначе живой стоп ошибочно помечался Cancelled и плодились дубли
+                        if not self._order_alive_on_exchange(pair, order_id):
+                            self.trades_repo.update_order_status(order_id, 'Cancelled')
 
                 executions = self.client.get_executions(
                     category="spot",
@@ -203,6 +207,9 @@ class PositionService:
                             continue
 
                         position_id = self.trades_repo.get_order_position_id(order_id)
+                        if str(side) == 'Sell':
+                            # комиссия продажи списывается в USDT
+                            exit_fee_usdt += fee_val if fee_val < price_val * qty_val else 0.0
                         trade_data = {
                             'trade_id': str(trade_id),
                             'order_id': str(order_id),
@@ -217,8 +224,60 @@ class PositionService:
                         }
                         self.trades_repo.create_trade_if_not_exists(trade_data)
 
+                if (order.get('is_tp') or order.get('is_sl')) and status in ('Filled', 'PartiallyFilledCanceled') \
+                        and filled_qty and avg_price:
+                    msg = await self._handle_exit_fill(order, status, filled_qty, avg_price, exit_fee_usdt)
+                    if msg:
+                        messages.append(msg)
+
             except Exception as e:
                 logger.debug(f"sync_orders_and_trades error for {pair} {order_id}: {e}")
+
+        return messages
+
+    async def _handle_exit_fill(self, order: dict, status: str, filled_qty: float,
+                                avg_price: float, exit_fee_usdt: float) -> Optional[str]:
+        """Исполнился TP/SL на бирже → закрыть позицию в БД с реальным PnL."""
+        position_id = order.get('position_id')
+        if not position_id:
+            return None
+        pos = self.trades_repo.get_position_by_id(position_id)
+        if not pos or pos.get('status') != 'OPEN':
+            return None
+
+        pair = pos['pair']
+        entry = float(pos.get('avg_entry_price') or pos['entry_price'])
+        qty = float(pos['quantity'])
+        kind = "TP" if order.get('is_tp') else "SL"
+
+        if filled_qty < qty * 0.95:
+            # частичное исполнение: уменьшаем позицию, защиту оставляем
+            self.trades_repo.update_position_quantity(position_id, max(0.0, qty - filled_qty))
+            logger.info(f"📉 {pair}: {kind} исполнен частично {filled_qty}/{qty}")
+            return None
+
+        gross = (avg_price - entry) * filled_qty
+        entry_fee = float(pos.get('commission_paid') or 0)
+        fees = entry_fee + exit_fee_usdt
+        net = gross - fees
+        try:
+            self.trades_repo.update_position_pnl_breakdown(
+                position_id, commission_paid=fees, slippage=float(pos.get('slippage') or 0),
+                gross_pnl=gross, net_pnl=net,
+            )
+        except Exception as e:
+            logger.debug(f"pnl breakdown {pair}: {e}")
+        self._close_position_with_pnl(position_id, pair, avg_price, net)
+        # второй защитный ордер больше не нужен (иначе он «висит» и блокирует монеты)
+        await self._cancel_position_orders(position_id)
+
+        pct = (avg_price - entry) / entry * 100 if entry else 0.0
+        emoji = "🎯" if kind == "TP" else "🛑"
+        sign = "+" if net >= 0 else "-"
+        msg = (f"{emoji} {kind} {pair}: позиция закрыта @ {avg_price:.6g} "
+               f"({pct:+.2f}%) | PnL {sign}${abs(net):.2f} (комиссии ${fees:.2f})")
+        logger.info(msg)
+        return msg
 
     async def reconcile_orphan_orders(self) -> List[str]:
         """
@@ -232,12 +291,14 @@ class PositionService:
         # --- Шаг 1: получить все открытые ордера на бирже (spot) ---
         exchange_orders = {}  # {order_id: order_dict}
         try:
-            resp = self.client.get_open_orders(category="spot")
-            if resp.get('retCode') == 0:
-                for o in (resp.get('result', {}).get('list') or []):
-                    oid = o.get('orderId')
-                    if oid:
-                        exchange_orders[oid] = o
+            # обычные ордера + условные (SL с triggerPrice) — они выдаются отдельно
+            for extra in ({}, {"orderFilter": "StopOrder"}, {"orderFilter": "tpslOrder"}):
+                resp = self.client.get_open_orders(category="spot", **extra)
+                if resp.get('retCode') == 0:
+                    for o in (resp.get('result', {}).get('list') or []):
+                        oid = o.get('orderId')
+                        if oid:
+                            exchange_orders[oid] = o
         except Exception as e:
             logger.error(f"❌ reconcile: ошибка получения ордеров с биржи: {e}")
             return [f"❌ Ошибка получения ордеров: {e}"]
@@ -251,11 +312,10 @@ class PositionService:
             if oid not in db_order_ids:
                 pair = exo.get('symbol', '???')
                 try:
-                    cancel_resp = self.client.cancel_order(category="spot", symbol=pair, orderId=oid)
-                    if cancel_resp.get('retCode') == 0:
-                        msg = f"🗑️ Orphan cancelled: {pair} order {oid}"
+                    if self._cancel_any_filter(pair, oid):
+                        msg = f"🗑️ Ордер-сирота отменён: {pair} {oid}"
                     else:
-                        msg = f"⚠️ Orphan cancel failed: {pair} {oid} — {cancel_resp.get('retMsg', '')}"
+                        msg = f"⚠️ Не удалось отменить ордер-сироту: {pair} {oid}"
                     logger.warning(msg)
                     messages.append(msg)
                 except Exception as e:
@@ -380,7 +440,7 @@ class PositionService:
                             self.trades_repo.set_position_tpsl(pos['id'], sl_price=new_sl)
                             self.trades_repo.update_order_price(sl_order['order_id'], new_sl)
                             
-                            msg = f" SL по {pair} подтянут до {new_sl:.4f} (Прибыль: {profit_pct*100:.2f}%)"
+                            msg = f"📈 Трейлинг {pair}: SL подтянут до {new_sl:.6g} (прибыль {profit_pct*100:.2f}%)"
                             logger.info(msg)
                             messages.append(msg)
                         else:
@@ -502,6 +562,34 @@ class PositionService:
             logger.error(f"❌ Ошибка закрытия позиции: {e}")
             return False
     
+    def _cancel_any_filter(self, pair: str, order_id: str) -> bool:
+        """
+        Отменить спот-ордер любого вида. Условные ордера (SL с triggerPrice) на споте
+        отменяются только с orderFilter=StopOrder/tpslOrder, обычные — без него.
+        """
+        for extra in ({}, {"orderFilter": "StopOrder"}, {"orderFilter": "tpslOrder"}):
+            try:
+                resp = self.client.cancel_order(category="spot", symbol=pair, orderId=order_id, **extra)
+                if resp.get('retCode') == 0:
+                    return True
+            except Exception as e:
+                text = str(e)
+                # «ордер не существует / уже исполнен» — считаем отменённым
+                if '170213' in text or '110001' in text or 'does not exist' in text.lower():
+                    return True
+        return False
+
+    def _order_alive_on_exchange(self, pair: str, order_id: str) -> bool:
+        """Есть ли ордер среди открытых, включая условные (StopOrder / tpslOrder)."""
+        for extra in ({}, {"orderFilter": "StopOrder"}, {"orderFilter": "tpslOrder"}):
+            try:
+                resp = self.client.get_open_orders(category="spot", symbol=pair, orderId=order_id, **extra)
+                if resp.get('retCode') == 0 and (resp.get('result') or {}).get('list'):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _cancel_position_orders(self, position_id: int) -> None:
         """Отменить все открытые ордера позиции"""
         try:
@@ -511,23 +599,16 @@ class PositionService:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT order_id, pair FROM orders
-                    WHERE position_id = ? AND status IN ('New', 'PartiallyFilled')
+                    WHERE position_id = ? AND status IN ('New', 'PartiallyFilled', 'Untriggered', 'Triggered', 'Active')
                 """, (position_id,))
                 
                 orders = cursor.fetchall()
             
             for order in orders:
-                try:
-                    self.client.cancel_order(
-                        category="spot",
-                        symbol=order['pair'],
-                        orderId=order['order_id']
-                    )
-                    
+                if self._cancel_any_filter(order['pair'], order['order_id']):
                     self.trades_repo.update_order_status(order['order_id'], 'Cancelled')
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось отменить ордер {order['order_id']}: {e}")
+                else:
+                    logger.warning(f"⚠️ Не удалось отменить ордер {order['order_id']} ({order['pair']})")
                     
         except Exception as e:
             logger.error(f"❌ Ошибка отмены ордеров: {e}")
@@ -550,7 +631,7 @@ class PositionService:
                 if current_price <= sl_price:
                     closed = await self.close_position(position_id, reason="emergency_sl")
                     if closed:
-                        msg = f"🛑 EMERGENCY SL {pair}: цена {current_price:.4f} <= SL {sl_price:.4f} — закрыто маркетом"
+                        msg = f"🛑 EMERGENCY SL {pair}: цена {current_price:.6g} ≤ SL {sl_price:.6g} — закрыто маркетом"
                         logger.warning(msg)
                         messages.append(msg)
 
@@ -611,7 +692,7 @@ class PositionService:
                         self.trades_repo.update_order_price(sl_order['order_id'], new_sl)
                         self._set_breakeven_flag(pos['id'])
                         
-                        msg = f"🛡️ BREAKEVEN {pair}: SL перенесён в {new_sl:.4f} (вход: {entry:.4f})"
+                        msg = f"🛡️ Безубыток {pair}: SL перенесён в {new_sl:.6g} (вход {entry:.6g})"
                         logger.info(msg)
                         messages.append(msg)
                     else:
@@ -800,7 +881,7 @@ class PositionService:
                     # Обновляем sl_price в позиции
                     self.trades_repo.set_position_tpsl(position_id, sl_price=sl_price)
                     
-                    msg = f"✅ AUTO-SL создан: {pair} qty={formatted_qty} @ {sl_price:.2f}"
+                    msg = f"✅ AUTO-SL создан: {pair} qty={formatted_qty} @ {sl_price:.6g}"
                     logger.info(msg)
                     messages.append(msg)
                 else:

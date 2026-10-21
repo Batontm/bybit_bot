@@ -134,3 +134,90 @@ async def test_analysis_service_technical_signal(monkeypatch):
     assert a['score'] == 75 and a['signal'] == 'BUY'
     a = await svc.analyze_pair('XUSDT', score=30)
     assert a['signal'] == 'AVOID'
+
+
+# ----------------------------------------------------------------- закрытие по TP/SL
+
+class _CancelClient:
+    def __init__(self):
+        self.cancelled = []
+
+    def cancel_order(self, **kw):
+        self.cancelled.append(kw)
+        return {'retCode': 0}
+
+
+async def test_tp_fill_closes_position_with_real_pnl():
+    import time
+    from bot.services.position_service import PositionService
+    from bot.db.trades_repo import TradesRepository
+    repo = TradesRepository()
+    pid = repo.create_position({'pair': 'ETHUSDT', 'entry_price': 2000.0, 'quantity': 0.5,
+                                'tp_price': 2100.0, 'sl_price': 1950.0, 'commission_paid': 1.0})
+    now = '2026-10-21T10:00:00+02:00'
+    uid = str(time.time_ns())
+    tp = {'order_id': f'tp{uid}', 'pair': 'ETHUSDT', 'side': 'Sell', 'order_type': 'Limit', 'price': 2100.0,
+          'quantity': 0.5, 'status': 'New', 'is_tp': True, 'position_id': pid, 'created_at': now, 'updated_at': now}
+    sl = dict(tp, order_id=f'sl{uid}', order_type='Market', price=1950.0, is_tp=False, is_sl=True,
+              status='Untriggered')
+    repo.create_order(tp)
+    repo.create_order(sl)
+
+    svc = PositionService.__new__(PositionService)
+    svc.trades_repo = repo
+    svc.client = _CancelClient()
+    from bot.db.pnl_repo import PnLRepository
+    svc.pnl_repo = PnLRepository()
+
+    msg = await svc._handle_exit_fill(dict(tp, position_id=pid), 'Filled', 0.5, 2100.0, 1.05)
+    pos = repo.get_position_by_id(pid)
+    assert pos['status'] == 'CLOSED'
+    # (2100-2000)*0.5 = 50, минус комиссии 1.0 + 1.05
+    assert pos['realized_pnl'] == pytest.approx(47.95)
+    assert msg.startswith('🎯 TP ETHUSDT') and '+$47.95' in msg
+    # второй защитный ордер (условный SL в статусе Untriggered) отменён
+    assert any(c.get('orderId') == f'sl{uid}' for c in svc.client.cancelled)
+
+
+async def test_partial_fill_reduces_quantity():
+    import time
+    from bot.services.position_service import PositionService
+    from bot.db.trades_repo import TradesRepository
+    repo = TradesRepository()
+    pid = repo.create_position({'pair': 'SOLUSDT', 'entry_price': 100.0, 'quantity': 10.0})
+    svc = PositionService.__new__(PositionService)
+    svc.trades_repo = repo
+    svc.client = _CancelClient()
+    msg = await svc._handle_exit_fill({'position_id': pid, 'is_tp': True}, 'PartiallyFilledCanceled', 4.0, 105.0, 0.0)
+    assert msg is None
+    pos = repo.get_position_by_id(pid)
+    assert pos['status'] == 'OPEN' and pos['quantity'] == pytest.approx(6.0)
+
+
+def test_order_position_id_lookup():
+    import time
+    from bot.db.trades_repo import TradesRepository
+    repo = TradesRepository()
+    oid = f'o{time.time_ns()}'
+    repo.create_order({'order_id': oid, 'pair': 'X', 'side': 'Buy', 'order_type': 'Market', 'quantity': 1,
+                       'status': 'Filled', 'position_id': 42, 'created_at': 'x', 'updated_at': 'x'})
+    assert repo.get_order_position_id(oid) == 42
+
+
+def test_balance_free_without_deprecated_field(monkeypatch):
+    from bot.services.balance_service import BalanceService
+    svc = BalanceService.__new__(BalanceService)
+    svc.last_total_equity = None
+
+    class C:
+        def get_wallet_balance(self, **kw):
+            return {'retCode': 0, 'result': {'list': [{'totalEquity': '1500.5', 'coin': [
+                {'coin': 'USDT', 'walletBalance': '1000', 'availableToWithdraw': '', 'locked': '100',
+                 'totalOrderIM': '', 'usdValue': '1000'},
+                {'coin': 'ETH', 'walletBalance': '0.2', 'availableToWithdraw': '', 'locked': '0', 'usdValue': '500.5'},
+            ]}]}}
+    svc.client = C()
+    b = svc.get_wallet_balance()
+    assert b['USDT']['free'] == pytest.approx(900.0)      # раньше было 0
+    assert b['ETH']['usd_value'] == pytest.approx(500.5)
+    assert svc.last_total_equity == pytest.approx(1500.5)

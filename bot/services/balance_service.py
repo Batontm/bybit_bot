@@ -11,6 +11,14 @@ from ..error_tracker import error_tracker
 DUST_THRESHOLD_USD = 5.0  # Балансы дешевле $5 считаются пылью
 
 
+def _num(v) -> float:
+    """Число из ответа Bybit: пустые строки и None → 0."""
+    try:
+        return float(v) if v not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class BalanceService:
     """Управление балансами и депозитом"""
     
@@ -21,6 +29,7 @@ class BalanceService:
             api_secret=BYBIT_API_SECRET,
             recv_window=60000
         )
+        self.last_total_equity: Optional[float] = None  # totalEquity аккаунта в USD
     
     def get_wallet_balance(self) -> Optional[Dict]:
         """Получить баланс через wallet balance endpoint"""
@@ -37,25 +46,25 @@ class BalanceService:
             
             account_data = response['result']['list'][0]
             coins = account_data.get('coin', [])
+            self.last_total_equity = _num(account_data.get('totalEquity'))
             
             balances = {}
             for coin_data in coins:
                 coin = coin_data['coin']
-                
-                # ИСПРАВЛЕНО: безопасное преобразование с обработкой пустых строк
-                wallet_balance_str = coin_data.get('walletBalance', '0')
-                available_str = coin_data.get('availableToWithdraw', '0')
-                
-                # Если пустая строка, заменяем на '0'
-                wallet_balance = float(wallet_balance_str if wallet_balance_str else '0')
-                available = float(available_str if available_str else '0')
+                wallet_balance = _num(coin_data.get('walletBalance'))
+                # availableToWithdraw устарел с 09.01.2025 и приходит пустым —
+                # свободно = баланс − заблокировано ордерами (спот) − маржа ордеров
+                locked = _num(coin_data.get('locked')) + _num(coin_data.get('totalOrderIM'))
+                available = max(0.0, wallet_balance - locked)
+                usd_value = _num(coin_data.get('usdValue'))
                 
                 if wallet_balance > 0:
                     balances[coin] = {
                         'coin': coin,
                         'total': wallet_balance,
                         'free': available,
-                        'used': wallet_balance - available
+                        'used': wallet_balance - available,
+                        'usd_value': usd_value,
                     }
             
             return balances

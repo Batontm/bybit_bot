@@ -36,7 +36,7 @@ from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 
 
-BOT_VERSION = "v2.2.0"
+BOT_VERSION = "v2.4.0"
 
 
 class BotController:
@@ -500,7 +500,9 @@ class BotController:
 
     async def _sync_orders_and_trades(self):
         try:
-            await self.position_service.sync_orders_and_trades()
+            messages = await self.position_service.sync_orders_and_trades() or []
+            for msg in messages:
+                await self._send_notification(msg)
         except Exception as e:
             logger.error(f"❌ Ошибка синхронизации ордеров: {e}")
 
