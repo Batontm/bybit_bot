@@ -375,7 +375,9 @@ class PositionService:
                 logger.debug(f"reconcile history check error {pair} {oid}: {e}")
 
         if not messages:
-            messages.append("✅ Reconcile: расхождений не найдено")
+            # В Telegram сообщаем только о расхождениях: «всё в порядке» каждые
+            # 5 часов забивало чат. Ручной запуск и так отвечает «Сверка завершена».
+            logger.debug("✅ Reconcile: расхождений не найдено")
 
         return messages
 

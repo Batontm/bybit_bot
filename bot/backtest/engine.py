@@ -159,7 +159,7 @@ def run(data: Dict[str, Dict[str, List[dict]]], pairs: Iterable[str], *,
         if use_regime:
             k = ('BTC', 'regime', btc["240"].index(t))
             if k not in cache:
-                p, e, r, a = regime_metrics(btc["240"].upto(t, 260))
+                p, e, r, a = regime_metrics(btc["240"].upto(t, 1000))
                 cache[k] = (regime_allowed(p, e, r, a), a)
             allowed, _atr_ratio = cache[k]
             if not allowed:
@@ -457,6 +457,91 @@ def run_trend(data: Dict[str, Dict[str, List[dict]]], pairs: Iterable[str], *,
 
     for pair, pos in open_pos.items():
         close(pair, pos, _last_close(days[pair], end_ts), end_ts, 'end')
+    return res
+
+
+# ----------------------------------------------------------------- покупка на просадке (4h)
+
+DIP_GRID = [
+    {'DIP_RSI_MAX': r, 'DIP_STOP_ATR': st, 'DIP_TREND_EMA': e}
+    for r in (25, 30, 35) for st in (1.5, 2.5) for e in (0, 600)
+]
+
+
+def run_dip(data: Dict[str, Dict[str, List[dict]]], pairs: Iterable[str], *,
+            start_ts: int, end_ts: int, equity: float = 10_000.0, use_guard: bool = True,
+            **_ignored) -> Result:
+    """
+    Покупка на просадке на свечах 4h (bot/services/dip_strategy.py).
+    Вход по закрытию сигнальной свечи; стоп проверяется внутри следующих свечей и
+    считается раньше цели (консервативно); выход по цели/времени — по закрытию свечи.
+    """
+    from bot.services import dip_strategy as D
+    slip, fee = cfg.SLIPPAGE_ESTIMATE, cfg.TRADING_FEE_RATE
+    pairs = [p for p in pairs if p in data and data[p].get('240')]
+    candles = {p: data[p]['240'] for p in pairs}
+    ind = {p: D.indicators(candles[p]) for p in pairs}
+    idx_by_close = {p: {c['start'] + H4: i for i, c in enumerate(candles[p])} for p in pairs}
+    timeline = sorted({t for p in pairs for t in idx_by_close[p] if start_ts <= t <= end_ts})
+    res = Result(start_equity=equity)
+    open_pos: Dict[str, dict] = {}
+    last_close: Dict[str, float] = {}
+    peak = equity
+
+    def close(pair, pos, price, t, kind):
+        nonlocal equity
+        pnl = price * pos['qty'] * (1 - fee) - pos['entry'] * pos['qty'] * (1 + fee)
+        equity += pnl
+        res.trades.append(Trade(pair=pair, opened_ts=pos['opened'], closed_ts=t, entry=pos['entry'],
+                                stop=pos['stop'], qty=pos['qty'], risk_usd=pos['risk_usd'], pnl=pnl,
+                                r_multiple=pnl / pos['risk_usd'] if pos['risk_usd'] else 0.0, exit_kind=kind,
+                                trigger='dip', pullback_ok=False, rs_ok=False, score=0))
+
+    for t in timeline:
+        for pair in pairs:
+            i = idx_by_close[pair].get(t)
+            if i is None:
+                continue
+            bar = candles[pair][i]
+            last_close[pair] = bar['close']
+            pos = open_pos.get(pair)
+            if pos:
+                pos['bars'] += 1
+                mid = ind[pair]['mid'][i]
+                if bar['low'] <= pos['stop']:
+                    close(pair, pos, min(pos['stop'], bar['open']) * (1 - slip), t, 'stop')
+                    del open_pos[pair]
+                elif mid is not None and bar['close'] >= mid:
+                    close(pair, pos, bar['close'] * (1 - slip), t, 'target')
+                    del open_pos[pair]
+                elif pos['bars'] >= cfg.DIP_MAX_BARS:
+                    close(pair, pos, bar['close'] * (1 - slip), t, 'time')
+                    del open_pos[pair]
+                continue
+            if res.halted_at is not None or len(open_pos) >= cfg.DIP_MAX_POSITIONS:
+                continue
+            ok, info = D.entry_at(candles[pair], ind[pair], i)
+            if not ok:
+                continue
+            res.signals_seen += 1
+            entry, stop = bar['close'] * (1 + slip), info['stop']
+            qty = X.position_size(equity, cfg.DIP_RISK_PER_TRADE, entry, stop)
+            invested = sum(p['entry'] * p['qty'] for p in open_pos.values())
+            qty = min(qty, max(0.0, equity * 0.98 - invested) / entry)
+            if qty * entry < cfg.MIN_ORDER_SIZE_USD:
+                res.skipped['нет свободных средств'] = res.skipped.get('нет свободных средств', 0) + 1
+                continue
+            open_pos[pair] = {'entry': entry, 'stop': stop, 'qty': qty, 'opened': t, 'bars': 0,
+                              'risk_usd': qty * (entry - stop + X.cost_per_unit(entry))}
+        mark = equity + sum((last_close.get(p, pos['entry']) - pos['entry']) * pos['qty']
+                            for p, pos in open_pos.items())
+        res.equity_curve.append((t, mark))
+        peak = max(peak, mark)
+        if use_guard and res.halted_at is None and peak > 0 and 1 - mark / peak >= cfg.MAX_DRAWDOWN_STOP:
+            res.halted_at = t
+
+    for pair, pos in open_pos.items():
+        close(pair, pos, last_close.get(pair, pos['entry']), end_ts, 'end')
     return res
 
 

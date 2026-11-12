@@ -161,6 +161,82 @@ def ext_comparison(data, trend_pairs, start_ts, end_ts, args, loader=None):
     return lines, out
 
 
+def main_dip(args, pairs) -> int:
+    """Бэктест покупки на просадке: нужны только свечи 4h, поэтому грузим их отдельно (быстро)."""
+    from .data import fetch_klines
+    print(f"🧪 Бэктест: покупка на просадке (4h), {len(pairs)} пар, {args.days} дней, "
+          f"комиссия {cfg.TRADING_FEE_RATE * 100:.2f}%")
+    t0 = time.time()
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - (args.days + 160) * 86_400_000     # прогрев длинной EMA
+    data = {}
+    for p in pairs:
+        print(f"📥 {p}...")
+        try:
+            rows = fetch_klines(p, "240", start_ms, end_ms, offline=args.offline)
+        except Exception as e:
+            print(f"  ⚠️ {p} пропущена: {e}")
+            continue
+        if rows:
+            data[p] = {"240": rows}
+    pairs = [p for p in pairs if p in data]
+    if not pairs:
+        print("❌ Нет данных (проверьте сеть или кэш data/klines)")
+        return 1
+    end_ts = max(data[p]["240"][-1]['start'] for p in pairs) + E.H4
+    start_ts = end_ts - args.days * 86_400_000
+    fmt_d = lambda ts: datetime.fromtimestamp(ts / 1000, timezone.utc).strftime('%Y-%m-%d')
+    kw = dict(use_guard=not args.no_guard)
+
+    res = E.run_dip(data, pairs, start_ts=start_ts, end_ts=end_ts, equity=args.equity, **kw)
+    m = E.metrics(res)
+    wf = None
+    if not args.no_walk_forward and args.folds >= 2:
+        print(f"🔁 Просадка: walk-forward {args.folds} шагов, сетка {len(E.DIP_GRID)} вариантов...")
+        wf = E.walk_forward(data, pairs, start_ts=start_ts, end_ts=end_ts, folds=args.folds, equity=args.equity,
+                            grid=E.DIP_GRID, runner=E.run_dip, min_train_trades=10, **kw)
+    # для сравнения: «купил и держал» те же пары равными долями
+    bh = []
+    for p in pairs:
+        c = [x for x in data[p]["240"] if start_ts <= x['start'] < end_ts]
+        if c:
+            bh.append(c[-1]['close'] / c[0]['open'] - 1)
+    lines = [
+        "# Бэктест: покупка на просадке (4h)", "",
+        f"Период: {fmt_d(start_ts)} — {fmt_d(end_ts)} ({args.days} дн.)",
+        f"Капитал {args.equity:,.0f} USDT, комиссия {cfg.TRADING_FEE_RATE * 100:.2f}% + проскальзывание "
+        f"{cfg.SLIPPAGE_ESTIMATE * 100:.2f}%", "",
+        f"Пары: {', '.join(pairs)}. Вход — RSI(14) ≤ {cfg.DIP_RSI_MAX} и закрытие под нижней полосой Боллинджера "
+        f"({cfg.DIP_BB_PERIOD}, {cfg.DIP_BB_STD})"
+        + (f", цена выше EMA{cfg.DIP_TREND_EMA}" if cfg.DIP_TREND_EMA > 0 else "")
+        + f"; стоп {cfg.DIP_STOP_ATR}×ATR; выход — возврат к SMA{cfg.DIP_BB_PERIOD} или {cfg.DIP_MAX_BARS} свечей. "
+        f"Риск на сделку {cfg.DIP_RISK_PER_TRADE * 100:.2f}%.", "",
+        f"Для сравнения, «купил и держал» эти пары за период: "
+        f"{_pct(sum(bh) / len(bh)) if bh else '—'} (в среднем).", "",
+    ]
+    lines += _fmt_metrics("Весь период, текущие настройки", m)
+    lines += _fmt_breakdown("По парам", E.breakdown(res.trades, lambda t: t.pair))
+    lines += _fmt_breakdown("По годам", E.breakdown(res.trades, lambda t: fmt_d(t.opened_ts)[:4]))
+    lines += _fmt_wf(wf, fmt_d)
+    lines += verdict(m, wf, min_trades=30)
+
+    out = Path(args.out) if args.out else Path(__file__).resolve().parents[2] / "data" / "backtest" / \
+        (datetime.now().strftime("%Y-%m-%d_%H%M") + "_dip")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
+    with (out / "trades.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["pair", "opened_utc", "closed_utc", "entry", "stop", "qty", "risk_usd", "pnl", "r", "exit"])
+        for t in res.trades:
+            w.writerow([t.pair, fmt_d(t.opened_ts), fmt_d(t.closed_ts), f"{t.entry:.8g}", f"{t.stop:.8g}",
+                        f"{t.qty:.8g}", f"{t.risk_usd:.2f}", f"{t.pnl:.2f}", f"{t.r_multiple:.3f}", t.exit_kind])
+    summary = {'dip': {'metrics': m, 'walk_forward': {k: v for k, v in (wf or {}).items() if k != 'steps'}}}
+    (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    print("\n".join(lines))
+    print(f"\n📄 Отчёт: {out / 'report.md'}  ({time.time() - t0:.0f} с)")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m bot.backtest", description="Бэктест воронки входа")
     ap.add_argument("--days", type=int, default=365, help="длина периода в днях (по умолчанию 365)")
@@ -172,14 +248,16 @@ def main(argv=None) -> int:
     ap.add_argument("--require-rs", action="store_true", help="входить только если монета сильнее BTC")
     ap.add_argument("--no-guard", action="store_true", help="без паузы после убытков и стопа по просадке")
     ap.add_argument("--offline", action="store_true", help="не качать, использовать только кэш")
-    ap.add_argument("--strategy", choices=("funnel", "trend", "both"), default="both",
-                    help="какую стратегию проверять (по умолчанию обе)")
+    ap.add_argument("--strategy", choices=("funnel", "trend", "both", "dip"), default="both",
+                    help="какую стратегию проверять (по умолчанию funnel+trend; dip — покупка на просадке 4h)")
     ap.add_argument("--ext", action="store_true",
                     help="тренд: сравнить фильтры по открытым данным Binance/Coinbase (funding, объём, премия)")
     ap.add_argument("--out", default=None, help="папка для отчёта (по умолчанию data/backtest/<дата>)")
     args = ap.parse_args(argv)
 
     pairs = [p.strip().upper() for p in args.pairs.split(",") if p.strip()]
+    if args.strategy == "dip":
+        return main_dip(args, pairs if args.pairs != ",".join(DEFAULT_PAIRS) else list(cfg.DIP_PAIRS))
     do_funnel = args.strategy in ("funnel", "both")
     do_trend = args.strategy in ("trend", "both")
     load_pairs = list(dict.fromkeys((pairs if do_funnel else []) + (list(cfg.TREND_PAIRS) if do_trend else [])))

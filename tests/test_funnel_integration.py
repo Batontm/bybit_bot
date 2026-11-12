@@ -170,6 +170,10 @@ def _trading(monkeypatch, client):
 
 
 async def test_open_with_plan_limit_post_only(monkeypatch):
+    # риск уменьшается при высокой волатильности BTC (запрос к живому рынку) —
+    # отключаем, иначе тест зависит от того, что сейчас происходит на бирже
+    from config import trading_config
+    monkeypatch.setattr(trading_config, 'VOL_RISK_SCALING', False)
     client = FakeTradingClient()
     svc = _trading(monkeypatch, client)
     plan = EntryFunnelService(client=FakeMarket()).scan()[0]['plan']

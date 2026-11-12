@@ -344,6 +344,31 @@ class TechnicalIndicators:
     # ----------------------------------------------------------------- series
 
     @staticmethod
+    def rsi_wilder(closes: List[float], period: int = 14) -> Optional[float]:
+        """
+        RSI со сглаживанием Уайлдера — стандартный, как на графике Bybit / TradingView.
+        calculate_rsi() выше берёт простое среднее последних period свечей: значение
+        «дёргается» и расходится с графиком на 3–8 пунктов. На нём настроена воронка,
+        поэтому он оставлен как есть; светофор считает RSI этим методом.
+        """
+        if len(closes) < period + 1:
+            return None
+        gain = loss = 0.0
+        for i in range(1, period + 1):
+            d = closes[i] - closes[i - 1]
+            gain += max(d, 0.0)
+            loss += max(-d, 0.0)
+        gain /= period
+        loss /= period
+        for i in range(period + 1, len(closes)):
+            d = closes[i] - closes[i - 1]
+            gain = (gain * (period - 1) + max(d, 0.0)) / period
+            loss = (loss * (period - 1) + max(-d, 0.0)) / period
+        if loss == 0:
+            return 100.0
+        return round(100 - 100 / (1 + gain / loss), 2)
+
+    @staticmethod
     def ema_series(closes: List[float], period: int) -> List[float]:
         """EMA для каждой свечи начиная с индекса period-1 (начальное значение = SMA)."""
         if len(closes) < period:

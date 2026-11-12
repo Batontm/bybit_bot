@@ -22,7 +22,7 @@ def regime_metrics(candles, ema_period: int = 200, rsi_period: int = 14, atr_win
     lows = [c['low'] for c in candles]
     price = closes[-1] if closes else None
     ema = TechnicalIndicators.calculate_ema(closes, ema_period)
-    rsi = TechnicalIndicators.calculate_rsi(closes, rsi_period)
+    rsi = TechnicalIndicators.rsi_wilder(closes, rsi_period)   # стандартный RSI (Уайлдер)
     atr_ratio = None
     atrs = TechnicalIndicators.atr_series(highs, lows, closes, 14)
     if len(atrs) > atr_windows:
@@ -69,6 +69,7 @@ class MarketRegimeService:
     RSI_MIN = 40
     ATR_SPIKE_MULTIPLIER = 2.0  # Блокировка если ATR > 2x от среднего (паника)
     ATR_AVG_WINDOWS = 30        # Сколько предыдущих значений ATR усреднять
+    KLINE_LIMIT = 1000          # Свечей 4H на расчёт (прогрев EMA200)
 
     def __init__(self) -> None:
         # Read-only market data. Use mainnet for stable candles even when trading on testnet.
@@ -92,7 +93,10 @@ class MarketRegimeService:
 
     def _compute_status(self, now: datetime) -> RegimeStatus:
         try:
-            limit = self.EMA_PERIOD + 50
+            # EMA200 нужен длинный прогрев: на 250 свечах она ещё «помнит» стартовую
+            # SMA и расходится с графиком биржи на ~1% (на падении — завышена, светофор
+            # дольше красный). 1000 свечей — максимум Bybit за запрос, ошибка < 0.01%.
+            limit = self.KLINE_LIMIT
             resp = self._client.get_kline(
                 category="spot",
                 symbol=self.REGIME_PAIR,
