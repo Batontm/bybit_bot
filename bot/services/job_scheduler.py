@@ -24,6 +24,9 @@ from config.trading_config import (
     ARBITRAGE_CHECK_INTERVAL,
     ARBITRAGE_ENABLED,
     BALANCE_UPDATE_INTERVAL,
+    DIGEST_ENABLED,
+    DIGEST_HOUR,
+    DIGEST_MINUTE,
     SIGNAL_CHECK_INTERVAL,
     TPSL_CHECK_INTERVAL,
 )
@@ -82,7 +85,12 @@ def _build_jobs() -> List[JobSpec]:
         # Трендовая стратегия: после закрытия дневной свечи (00:00 UTC) и ещё 3 раза в сутки
         ('trend_strategy',    'Трендовая стратегия (D1)',
          '_run_trend', CronTrigger(hour='0,6,12,18', minute=10, timezone='UTC')),
-    ]
+    ] + ([
+        # Ежедневная сводка в Telegram (она же — сигнал «бот жив»)
+        ('daily_digest',      'Ежедневная сводка',
+         '_send_daily_digest',
+         CronTrigger(hour=DIGEST_HOUR, minute=DIGEST_MINUTE, timezone=TIMEZONE)),
+    ] if DIGEST_ENABLED else [])
 
 
 def _build_arbitrage_jobs() -> List[JobSpec]:

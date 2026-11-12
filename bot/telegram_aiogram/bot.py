@@ -70,6 +70,7 @@ class AiogramTelegramBot:
                 BotCommand(command="positions", description="Позиции и их закрытие"),
                 BotCommand(command="signals", description="Сигналы: последний проход воронки"),
                 BotCommand(command="regime", description="Светофор BTC 4H"),
+                BotCommand(command="digest", description="Сводка: светофор, капитал, до сигнала тренда"),
                 BotCommand(command="pnl", description="Статистика PnL"),
                 BotCommand(command="arbitrage", description="Арбитраж"),
                 BotCommand(command="settings", description="Настройки"),

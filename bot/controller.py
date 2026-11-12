@@ -38,7 +38,7 @@ from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 
 
-BOT_VERSION = "v2.7.2"
+BOT_VERSION = "v2.7.3"
 
 
 class BotController:
@@ -605,6 +605,18 @@ class BotController:
                 await self._send_notification(msg)
         except Exception as e:
             logger.error(f"❌ Трендовая стратегия: {e}")
+
+    def build_daily_digest(self) -> str:
+        """Текст ежедневной сводки (делает запросы к бирже — вызывать не из основного цикла)."""
+        from .services.daily_digest import collect, format_digest
+        return format_digest(collect(self))
+
+    async def _send_daily_digest(self):
+        """Ежедневная сводка в Telegram (обычное уведомление: выключается вместе с ними в Настройках)."""
+        try:
+            await self._send_notification(self.build_daily_digest())
+        except Exception as e:
+            logger.error(f"❌ Ежедневная сводка: {e}")
 
     async def _rebuild_protection_once(self):
         """v2.6: снять лимитные тейки старых версий и переставить стопы как StopOrder (один раз)."""

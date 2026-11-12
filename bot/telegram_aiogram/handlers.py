@@ -1129,6 +1129,19 @@ def create_router(controller=None) -> Router:
             return
         await _send_text(message, await _bg(_format_arbitrage_dashboard), reply_markup=_arbitrage_dashboard_kb().as_markup())
 
+    @router.message(Command("digest"))
+    async def cmd_digest(message: Message) -> None:
+        if not _is_allowed_message(message):
+            return
+        kb = _main_menu_kb()
+        if not controller or not hasattr(controller, "build_daily_digest"):
+            await _send_text(message, "❌ Сводка недоступна (controller не подключён)", reply_markup=kb.as_markup())
+            return
+        try:
+            await _send_text(message, await _bg(controller.build_daily_digest), reply_markup=kb.as_markup())
+        except Exception as e:
+            await _send_text(message, f"❌ Ошибка сводки: {e}", reply_markup=kb.as_markup())
+
     @router.message(Command("reconcile"))
     async def cmd_reconcile(message: Message) -> None:
         if not _is_allowed_message(message):
