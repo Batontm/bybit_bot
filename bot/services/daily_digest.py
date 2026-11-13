@@ -75,6 +75,10 @@ def format_digest(d: Dict[str, Any]) -> str:
                 line += f", RSI {r['rsi']:.0f}"
         lines.append(line)
 
+    ms = d.get('market_state')
+    if ms and ms.get('state'):
+        lines.append(f"{ms['icon']} Состояние рынка: {ms['label']} (ADX {ms['adx']:.0f})")
+
     if d.get('equity') is not None:
         line = f"💰 Капитал: {_money(d['equity'])} USDT"
         peak = d.get('equity_peak') or 0
@@ -118,6 +122,11 @@ def format_digest(d: Dict[str, Any]) -> str:
                 lines.append(f"   • {base} {_price(t['close'])} — условие выполнено, вход при закрытии дня")
             else:
                 lines.append(f"   • {base} {_price(t['close'])} → нужно выше {_price(t['need'])} (+{t['pct']:.1f}%)")
+
+    adm = d.get('admission')
+    if adm:
+        lines.append("🎛 Допуск стратегий:")
+        lines += [f"   {x}" for x in adm]
 
     problems = d.get('problems') or []
     if problems:
@@ -187,6 +196,11 @@ def collect(controller) -> Dict[str, Any]:
         from .arbitrage_service import arbitrage_service
         d['arbitrage_positions'] = len(arbitrage_service.repo.get_open_positions())
 
+    def _market_state():
+        from .trend_strategy import trend_service
+        from .market_state import current_state
+        d['market_state'] = current_state(trend_service._daily('BTCUSDT', limit=400))
+
     def _trend():
         if not cfg.TREND_ENABLED:
             return
@@ -205,10 +219,16 @@ def collect(controller) -> Dict[str, Any]:
                 rows.append({'pair': pair, **dist})
         d['trend'] = rows
 
+    def _admission():
+        from . import admission as A
+        d['admission'] = A.format_status(A.status())
+
     step("состояние бота", _state)
     step("светофор", _regime)
+    step("состояние рынка", _market_state)
     step("баланс", _equity)
     step("позиции", _positions)
     step("арбитраж", _arbitrage)
     step("тренд", _trend)
+    step("допуск стратегий", _admission)
     return d

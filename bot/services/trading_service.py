@@ -364,6 +364,9 @@ class TradingService:
         """Вход трендовой стратегии: рыночный ордер, стоп за 2×ATR дневной, тейка нет."""
         from config.trading_config import TREND_RISK_PER_TRADE
         from .exit_rules import position_size as size_with_costs
+        from . import admission
+        if not admission.is_live('TREND'):
+            return None, admission.deny_reason('TREND')
         can_trade, reason = self.check_risk_limits(strategy="TREND")
         if not can_trade:
             return None, reason

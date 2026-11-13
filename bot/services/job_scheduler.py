@@ -85,6 +85,9 @@ def _build_jobs() -> List[JobSpec]:
         # Трендовая стратегия: после закрытия дневной свечи (00:00 UTC) и ещё 3 раза в сутки
         ('trend_strategy',    'Трендовая стратегия (D1)',
          '_run_trend', CronTrigger(hour='0,6,12,18', minute=10, timezone='UTC')),
+        # Бумажная торговля кандидатов: после закрытия дневной свечи и ещё раз днём (на случай сбоя связи)
+        ('paper_trading',     'Бумажная торговля',
+         '_run_paper', CronTrigger(hour='0,12', minute=20, timezone='UTC')),
     ] + ([
         # Ежедневная сводка в Telegram (она же — сигнал «бот жив»)
         ('daily_digest',      'Ежедневная сводка',

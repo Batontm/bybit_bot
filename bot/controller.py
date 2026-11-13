@@ -38,7 +38,7 @@ from .services.slippage_guard import SlippageGuard
 from .services.job_scheduler import setup_jobs
 
 
-BOT_VERSION = "v2.7.3"
+BOT_VERSION = "v2.8.0"
 
 
 class BotController:
@@ -508,7 +508,9 @@ class BotController:
             entry_funnel_service.scan, exclude=open_pairs + arb_pairs, always_include=self.fixed_pairs
         )
         repo = entry_funnel_service.repo
-        if not self.funnel_trading_enabled:
+        from .services import admission
+        # сделки воронки — только при включённом переключателе И наличии допуска (таблица STRATEGY_ADMISSION)
+        if not self.funnel_trading_enabled or not admission.is_live('FUNNEL'):
             await self._funnel_signal_only(candidates)
             return
         self._note_signal("🧭 воронка", f"кандидатов: {len(candidates)}" if candidates else "кандидатов нет")
@@ -599,12 +601,25 @@ class BotController:
         """Трендовая стратегия на дневных свечах: стопы подтягиваются всегда, входы — только в ACTIVE."""
         try:
             from .services.trend_strategy import trend_service
-            allow = self.mode == "ACTIVE" and self.auto_trading_enabled
+            from .services import admission
+            # отзыв допуска при глубокой просадке стратегии — до поиска новых входов
+            for msg in admission.check_revocation():
+                await self._send_notification(msg)
+            allow = self.mode == "ACTIVE" and self.auto_trading_enabled and admission.is_live('TREND')
             messages = await trend_service.run(self.trading_service, self.position_service, allow_entries=allow)
             for msg in messages:
                 await self._send_notification(msg)
         except Exception as e:
             logger.error(f"❌ Трендовая стратегия: {e}")
+
+    async def _run_paper(self):
+        """Бумажная торговля стратегий-кандидатов (раз в сутки, после закрытия дневной свечи)."""
+        try:
+            from .services import paper_service
+            for msg in paper_service.run():
+                await self._send_notification(msg)
+        except Exception as e:
+            logger.error(f"❌ Бумажная торговля: {e}")
 
     def build_daily_digest(self) -> str:
         """Текст ежедневной сводки (делает запросы к бирже — вызывать не из основного цикла)."""

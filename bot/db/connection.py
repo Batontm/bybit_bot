@@ -177,6 +177,28 @@ class DatabaseConnection:
                 "CREATE INDEX IF NOT EXISTS idx_entry_signals_pair_time ON entry_signals(pair, created_at)"
             )
 
+            # 10. Бумажная торговля (сделки стратегий-кандидатов без ордеров)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy TEXT NOT NULL,
+                    pair TEXT NOT NULL,
+                    side INTEGER NOT NULL,
+                    opened_ts INTEGER NOT NULL,
+                    opened_at TEXT NOT NULL,
+                    entry REAL,
+                    stop REAL,
+                    state TEXT,
+                    status TEXT NOT NULL,
+                    closed_ts INTEGER,
+                    closed_at TEXT,
+                    exit_price REAL,
+                    r REAL,
+                    exit_kind TEXT,
+                    UNIQUE(strategy, pair, opened_ts)
+                )
+            """)
+
             self._apply_migrations(conn, cursor)
             
             conn.commit()

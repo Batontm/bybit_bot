@@ -206,8 +206,13 @@ async def test_open_with_plan_not_filled_cancels(monkeypatch):
     assert all(kw['side'] == 'Buy' for _, kw in client.orders)  # никаких TP/SL
 
 
-async def _run_controller(monkeypatch, strategy='FUNNEL', funnel_trading=True):
+async def _run_controller(monkeypatch, strategy='FUNNEL', funnel_trading=True, admitted=True):
     from bot import controller as ctrl_module
+    from config import trading_config
+    # сделки воронки требуют и переключателя, и допуска в STRATEGY_ADMISSION
+    table = dict(trading_config.STRATEGY_ADMISSION)
+    table['FUNNEL'] = {**table.get('FUNNEL', {}), 'level': 'LIVE' if admitted else 'OFF'}
+    monkeypatch.setattr(trading_config, 'STRATEGY_ADMISSION', table)
     from bot.services.entry_funnel_service import entry_funnel_service
 
     client = FakeTradingClient()
@@ -236,6 +241,12 @@ async def _run_controller(monkeypatch, strategy='FUNNEL', funnel_trading=True):
     monkeypatch.setattr(ctrl, '_is_pair_banned', lambda p: False)
     await ctrl._check_signals()
     return client, sent, analyzed
+
+
+async def test_controller_funnel_without_admission_only_signals(monkeypatch):
+    """Переключатель воронки включён, но допуска нет — сделок не будет, только сигнал."""
+    client, sent, analyzed = await _run_controller(monkeypatch, funnel_trading=True, admitted=False)
+    assert not any(kw['side'] == 'Buy' for _, kw in client.orders)
 
 
 async def test_controller_funnel_opens_position_without_ai(monkeypatch):

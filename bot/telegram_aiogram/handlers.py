@@ -1129,6 +1129,31 @@ def create_router(controller=None) -> Router:
             return
         await _send_text(message, await _bg(_format_arbitrage_dashboard), reply_markup=_arbitrage_dashboard_kb().as_markup())
 
+    @router.message(Command("admission"))
+    async def cmd_admission(message: Message) -> None:
+        """/admission — таблица допуска; /admission restore ИМЯ — вернуть отозванный допуск."""
+        if not _is_allowed_message(message):
+            return
+        from bot.services import admission as A
+        kb = _main_menu_kb()
+        parts = (message.text or "").split()
+        if len(parts) >= 3 and parts[1].lower() == "restore":
+            name = parts[2].upper()
+            ok = await _bg(A.restore, name)
+            text = (f"✅ Допуск {name} возвращён" if ok else f"ℹ️ У стратегии {name} нет отозванного допуска")
+            await _send_text(message, text, reply_markup=kb.as_markup())
+            return
+
+        def build() -> str:
+            lines = ["🎛 <b>Допуск стратегий</b>",
+                     "Торгует только то, чьё преимущество подтверждено. Остальное — на бумаге или запрещено.", ""]
+            lines += A.format_status(A.status(), detailed=True)
+            return "\n".join(lines)
+        try:
+            await _send_text(message, await _bg(build), reply_markup=kb.as_markup())
+        except Exception as e:
+            await _send_text(message, f"❌ Ошибка: {e}", reply_markup=kb.as_markup())
+
     @router.message(Command("digest"))
     async def cmd_digest(message: Message) -> None:
         if not _is_allowed_message(message):
